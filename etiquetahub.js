@@ -930,6 +930,8 @@ const { request, NotReady } = require('../http');
 
 const enc = s => encodeURIComponent(s).replace(/[!'()*]/g, c => '%' + c.charCodeAt(0).toString(16).toUpperCase());
 const arr = x => (x == null ? [] : Array.isArray(x) ? x : [x]);
+// Falabella a veces entrega { Orders: { Order: [...] } } y otras { Orders: [...] }: acepta ambas
+const list = (x, key) => (Array.isArray(x) ? x.flatMap(e => (e && e[key] !== undefined ? arr(e[key]) : [e])) : arr(x?.[key]));
 
 async function call(creds, action, params = {}) {
   const p = { Action: action, Format: 'JSON', Timestamp: new Date().toISOString().replace(/\.\d{3}Z$/, '+00:00'), UserID: creds.userId, Version: '1.0', ...params };
@@ -950,7 +952,7 @@ async function test(creds) { await call(creds, 'GetOrders', { Limit: '1' }); ret
 
 async function orderItems(creds, orderId) {
   const b = await call(creds, 'GetOrderItems', { OrderId: String(orderId) });
-  return arr(b.OrderItems?.OrderItem);
+  return list(b.OrderItems, 'OrderItem');
 }
 
 function normalize(order, items) {
@@ -980,7 +982,7 @@ async function listShipments(conn) {
   for (const status of ['pending', 'ready_to_ship']) {
     for (let offset = 0; offset < 1000; offset += 100) {
       const b = await call(conn.creds, 'GetOrders', { CreatedAfter: after, Status: status, Limit: '100', Offset: String(offset), SortBy: 'created_at', SortDirection: 'DESC' });
-      const orders = arr(b.Orders?.Order);
+      const orders = list(b.Orders, 'Order');
       for (const o of orders) {
         try { out.push(normalize(o, await orderItems(conn.creds, o.OrderId))); }
         catch (e) { console.warn('[Falabella] orden', o.OrderId, e.message); }
@@ -997,7 +999,7 @@ async function markReady(conn, ids) {
   let packageId = null;
   try {
     const b = await call(conn.creds, 'SetStatusToPackedByMarketplace', { OrderItemIds: JSON.stringify(ids.map(Number)), DeliveryType: 'dropship' });
-    packageId = arr(b.OrderItems?.OrderItem).find(i => i.PackageId)?.PackageId || null;
+    packageId = list(b.OrderItems, 'OrderItem').find(i => i.PackageId)?.PackageId || null;
   } catch (e) { console.warn('[Falabella] empaquetar:', e.message); }
   const params = { OrderItemIds: JSON.stringify(ids.map(Number)), DeliveryType: 'dropship' };
   if (packageId) params.PackageId = packageId;
@@ -1012,7 +1014,7 @@ async function fetchLabel(conn, order) {
     await markReady(conn, n.meta.orderItemIds);
   }
   const b = await call(conn.creds, 'GetDocument', { DocumentType: 'shippingParcel', OrderItemIds: JSON.stringify(n.meta.orderItemIds.map(Number)) });
-  const doc = arr(b.Documents?.Document)[0] || b.Document;
+  const doc = list(b.Documents, 'Document')[0] || b.Document;
   if (!doc?.File) throw new NotReady('Falabella todavía no entrega la etiqueta');
   const buf = Buffer.from(doc.File, 'base64');
   if (!String(doc.MimeType || '').includes('pdf') && buf.slice(0, 5).toString() !== '%PDF-') throw new Error(`Falabella entregó la etiqueta en formato ${doc.MimeType}; se necesita PDF`);
@@ -1023,11 +1025,13 @@ async function fetchLabel(conn, order) {
 async function debugList(conn) {
   const after = new Date(Date.now() - 10 * 864e5).toISOString().replace(/\.\d{3}Z$/, '+00:00');
   const b = await call(conn.creds, 'GetOrders', { CreatedAfter: after, Limit: '50', SortBy: 'created_at', SortDirection: 'DESC' });
-  const orders = arr(b.Orders?.Order);
+  const orders = list(b.Orders, 'Order');
   const first = orders[0];
   let items = null;
   if (first) { try { items = (await orderItems(conn.creds, first.OrderId)).map(i => ({ Status: i.Status, ShippingType: i.ShippingType, PromisedShippingTime: i.PromisedShippingTime, keys: Object.keys(i) })); } catch (e) { items = { error: e.message }; } }
-  return { bodyKeys: Object.keys(b), ordersType: Array.isArray(b.Orders) ? 'array' : typeof b.Orders, count: orders.length,
+  let noDate = null;
+  try { const b2 = await call(conn.creds, 'GetOrders', { Limit: '5', SortBy: 'created_at', SortDirection: 'DESC' }); noDate = list(b2.Orders, 'Order').map(o => ({ id: o.OrderId, created: o.CreatedAt, statuses: o.Statuses })); } catch (e) { noDate = { error: e.message }; }
+  return { noDate, sentAfter: after, bodyKeys: Object.keys(b), ordersType: Array.isArray(b.Orders) ? 'array' : typeof b.Orders, rawLen: Array.isArray(b.Orders) ? b.Orders.length : null, count: orders.length,
     orders: orders.map(o => ({ id: o.OrderId, created: o.CreatedAt, statuses: o.Statuses, keys: Object.keys(o).length })), firstItems: items };
 }
 
