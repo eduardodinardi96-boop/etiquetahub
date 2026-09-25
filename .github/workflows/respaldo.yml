@@ -1,0 +1,29 @@
+name: Respaldo EtiquetaHub
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+env:
+  APP_URL: https://etiquetahub-javi.onrender.com
+jobs:
+  respaldo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar respaldo cifrado y guardarlo en la rama "backup"
+        run: |
+          set -e
+          curl -fsS --retry 3 --max-time 90 -D headers.txt "$APP_URL/backup.enc" -o db.enc
+          HASH=$(grep -i '^x-plain-hash:' headers.txt | awk '{print $2}' | tr -d '\r')
+          git init -q repo && cd repo
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          if git fetch -q --depth 1 origin backup 2>/dev/null; then git checkout -q FETCH_HEAD -- hash.txt 2>/dev/null || true; fi
+          if [ -f hash.txt ] && [ "$(cat hash.txt)" = "$HASH" ]; then echo "Sin cambios"; exit 0; fi
+          git checkout -q --orphan backup
+          git rm -rfq . 2>/dev/null || true
+          cp ../db.enc db.enc && echo "$HASH" > hash.txt
+          git add db.enc hash.txt
+          git -c user.name="respaldo" -c user.email="respaldo@users.noreply.github.com" commit -qm "Respaldo $(date -u +%FT%TZ)"
+          git push -qf origin backup
+          echo "Respaldo guardado"
