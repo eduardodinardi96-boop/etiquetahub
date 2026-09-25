@@ -1201,45 +1201,62 @@ function labelPath(id) { return path.join(cfg.dataDir, 'labels', `${id}.pdf`); }
 
 const getOrder = id => db.prepare('SELECT * FROM orders WHERE id = ?').get(id);
 
+// Marca que la etiqueta ya está disponible en el marketplace, SIN descargarla.
+// (En Mercado Libre, descargar la etiqueta la marca como "impresa"; por eso solo se descarga al imprimir.)
 async function tryLabel(conn, orderId) {
   const order = getOrder(orderId);
   if (!order || !['waiting', 'error'].includes(order.state)) return;
-  if (blockedBy(order).length) return; // bloqueado: el fulfillment no recibe esta etiqueta
-  const connector = connectors[conn.row.marketplace];
-  try {
-    const original = await connector.fetchLabel(conn, order);
+  db.prepare(`UPDATE orders SET state='ready', error=NULL, updated_at=datetime('now') WHERE id=?`).run(order.id);
+  logEvent(order.seller_id, 'label', `Etiqueta disponible: pedido ${order.order_number}`);
+  bus.emit('change', { type: 'label', orderId: order.id, sellerId: order.seller_id });
+}
+
+// Descarga la etiqueta del marketplace y la prepara (100x150 + hoja de detalle). Solo se llama al imprimir.
+const fetching = new Map();
+function fetchLabelFile(orderId) {
+  if (fetching.has(orderId)) return fetching.get(orderId);
+  const p = (async () => {
+    const order = getOrder(orderId);
+    if (!order) throw new Error('Pedido no encontrado');
+    if (order.label_file && fs.existsSync(labelPath(order.id))) return labelPath(order.id);
+    const row = db.prepare('SELECT * FROM connections WHERE id=?').get(order.connection_id);
+    if (!row) throw new Error('La cuenta del marketplace ya no está conectada');
+    const conn = connObj(row);
+    const original = await connectors[row.marketplace].fetchLabel(conn, order);
     const seller = db.prepare('SELECT name FROM sellers WHERE id = ?').get(order.seller_id);
     const stamped = await stampLabel(original, {
       items: JSON.parse(order.items), seller: seller?.name || '', marketplace: order.marketplace, orderNumber: order.order_number,
       customer: JSON.parse(order.meta || '{}').customer || '',
     });
     fs.writeFileSync(labelPath(order.id), stamped);
-    fs.writeFileSync(labelPath(order.id + '.original'), original);
-    db.prepare(`UPDATE orders SET state='ready', label_file=?, label_at=datetime('now'), error=NULL, updated_at=datetime('now') WHERE id=?`).run(`${order.id}.pdf`, order.id);
-    logEvent(order.seller_id, 'label', `Etiqueta lista: pedido ${order.order_number}`);
-    bus.emit('change', { type: 'label', orderId: order.id, sellerId: order.seller_id });
-  } catch (e) {
-    const state = e instanceof NotReady ? 'waiting' : 'error';
-    db.prepare(`UPDATE orders SET state=?, error=?, updated_at=datetime('now') WHERE id=?`).run(state, e.message.slice(0, 500), order.id);
-    if (state === 'error') console.warn(`[etiqueta] pedido ${order.order_number}:`, e.message);
-    bus.emit('change', { type: 'order', orderId: order.id, sellerId: order.seller_id });
-  }
+    db.prepare(`UPDATE orders SET label_file=?, label_at=COALESCE(label_at, datetime('now')), error=NULL WHERE id=?`).run(`${order.id}.pdf`, order.id);
+    return labelPath(order.id);
+  })().finally(() => fetching.delete(orderId));
+  fetching.set(orderId, p);
+  return p;
 }
 
 async function upsert(conn, s) {
   const mk = s.mk || conn.row.marketplace;
   const existing = db.prepare('SELECT * FROM orders WHERE marketplace = ? AND external_id = ?').get(mk, s.external_id);
+  const printedOutside = mk === 'ml' && s.meta?.substatus === 'printed'; // la imprimieron directo en Mercado Libre
   if (!existing) {
     if (s.shipped || s.cancelled) return;
     const r = db.prepare(`INSERT INTO orders (seller_id, connection_id, marketplace, external_id, order_number, sold_at, items, meta)
       VALUES (?,?,?,?,?,?,?,?)`).run(conn.row.seller_id, conn.row.id, mk, s.external_id, s.order_number, s.sold_at || null, JSON.stringify(s.items), JSON.stringify(s.meta || {}));
     const id = Number(r.lastInsertRowid);
+    if (printedOutside) db.prepare(`UPDATE orders SET state='printed', printed_at=datetime('now'), printed_by='Mercado Libre' WHERE id=?`).run(id);
     logEvent(conn.row.seller_id, 'order', `Nuevo pedido ${s.order_number}`);
     bus.emit('change', { type: 'order', orderId: id, sellerId: conn.row.seller_id });
     return id;
   }
   let state = existing.state;
   if (s.cancelled && state !== 'printed') state = 'cancelled';
+  // Si la imprimieron en Mercado Libre (y no fue la app la que la descargó), pasa a impresa
+  if (printedOutside && ['ready', 'waiting', 'error'].includes(state) && !existing.label_at) {
+    state = 'printed';
+    db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by='Mercado Libre' WHERE id=?`).run(existing.id);
+  }
   db.prepare(`UPDATE orders SET items=?, meta=?, state=?, updated_at=datetime('now') WHERE id=?`)
     .run(JSON.stringify(s.items), JSON.stringify(s.meta || {}), state, existing.id);
   if (state !== existing.state) bus.emit('change', { type: 'order', orderId: existing.id, sellerId: conn.row.seller_id });
@@ -1288,9 +1305,9 @@ async function retryUnblocked(sellerId) {
 
 let timer = null;
 function start() {
-  // Si el servidor se reinició y se perdieron los PDF, se vuelven a pedir al marketplace
-  for (const o of db.prepare("SELECT id FROM orders WHERE state='ready'").all()) {
-    if (!fs.existsSync(labelPath(o.id))) db.prepare("UPDATE orders SET state='waiting', label_file=NULL WHERE id=?").run(o.id);
+  // Tras un reinicio los PDF guardados se pierden: se vuelven a descargar solo cuando alguien imprima
+  for (const o of db.prepare("SELECT id FROM orders WHERE label_file IS NOT NULL").all()) {
+    if (!fs.existsSync(labelPath(o.id))) db.prepare('UPDATE orders SET label_file=NULL WHERE id=?').run(o.id);
   }
   const every = (cfg.demo ? 20 : cfg.pollSeconds) * 1000;
   const tick = () => syncAll().catch(e => console.error('[sync]', e));
@@ -1299,7 +1316,7 @@ function start() {
   console.log(`Sincronización automática cada ${every / 1000} s`);
 }
 
-module.exports = { bus, start, tryLabel, syncConnection, syncAll, blockedBy, labelPath, connObj, connectors, retryUnblocked, logEvent };
+module.exports = { bus, start, tryLabel, fetchLabelFile, syncConnection, syncAll, blockedBy, labelPath, connObj, connectors, retryUnblocked, logEvent };
 
 };
 
@@ -1621,7 +1638,12 @@ async function route(req, res) {
     const o = db.prepare('SELECT * FROM orders WHERE id=?').get(Number(lab[1]));
     if (!o || (user.role === 'seller' && o.seller_id !== user.seller_id)) return fail(res, 404, 'Pedido no encontrado');
     if (user.role !== 'seller' && sync.blockedBy(o).length) return fail(res, 403, 'Etiqueta bloqueada por el vendedor');
-    if (!o.label_file || !fs.existsSync(sync.labelPath(o.id))) return fail(res, 409, 'La etiqueta aún no está lista');
+    if (!['ready', 'printed'].includes(o.state)) return fail(res, 409, 'La etiqueta aún no está lista');
+    if (!o.label_file || !fs.existsSync(sync.labelPath(o.id))) {
+      // Descargarla la marca como impresa en Mercado Libre: solo el fulfillment/admin la descarga, y solo al imprimir
+      if (user.role === 'seller') return fail(res, 409, 'Esta etiqueta todavía no se imprime');
+      try { await sync.fetchLabelFile(o.id); } catch (e) { return fail(res, 409, 'No se pudo obtener la etiqueta: ' + e.message); }
+    }
     if (user.role !== 'seller' && url.searchParams.get('mark') === '1') {
       db.prepare("UPDATE orders SET state='printed', printed_at=datetime('now'), printed_by=? WHERE id=?").run(user.name, o.id);
       sync.bus.emit('change', { type: 'printed', orderId: o.id, sellerId: o.seller_id });
@@ -1633,7 +1655,10 @@ async function route(req, res) {
     if (user.role === 'seller') return fail(res, 403, 'Solo el fulfillment descarga en lote');
     const { ids = [], mark = true } = await readBody(req);
     const rows = ids.map(Number).filter(Boolean).map(id => db.prepare('SELECT * FROM orders WHERE id=?').get(id)).filter(Boolean);
-    const allowed = rows.filter(o => !sync.blockedBy(o).length && o.label_file && fs.existsSync(sync.labelPath(o.id)));
+    const allowed = [];
+    for (const o of rows.filter(o => !sync.blockedBy(o).length && ['ready', 'printed'].includes(o.state))) {
+      try { await sync.fetchLabelFile(o.id); allowed.push(o); } catch (e) { console.warn('[imprimir]', o.order_number, e.message); }
+    }
     if (!allowed.length) return fail(res, 409, 'Ninguna de las etiquetas seleccionadas está disponible');
     const sellerName = id => db.prepare('SELECT name FROM sellers WHERE id=?').get(id)?.name || '';
     allowed.sort((a, b) => sellerName(a.seller_id).localeCompare(sellerName(b.seller_id)) || a.marketplace.localeCompare(b.marketplace) || a.id - b.id);
@@ -1653,7 +1678,7 @@ async function route(req, res) {
     if (!o || (user.role === 'seller' && o.seller_id !== user.seller_id)) return fail(res, 404, 'Pedido no encontrado');
     if (ret[2] === 'unprint') {
       if (user.role === 'seller') return fail(res, 403, 'No permitido');
-      db.prepare("UPDATE orders SET state=CASE WHEN label_file IS NOT NULL THEN 'ready' ELSE 'waiting' END, printed_at=NULL, printed_by=NULL WHERE id=?").run(o.id);
+      db.prepare("UPDATE orders SET state='ready', printed_at=NULL, printed_by=NULL WHERE id=?").run(o.id);
       sync.bus.emit('change', { type: 'order', orderId: o.id, sellerId: o.seller_id });
       return ok(res);
     }
