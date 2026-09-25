@@ -11,3 +11,5 @@ services:
         value: "120"
       - key: CUTOFF_TIME
         value: "09:00"
+      - key: RESET_ADMIN
+        value: "reinicio-1"

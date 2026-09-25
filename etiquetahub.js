@@ -1447,6 +1447,13 @@ async function route(req, res) {
 
 // ---------- datos iniciales ----------
 function bootstrap() {
+  // Reinicio del administrador (una sola vez por cada valor distinto de RESET_ADMIN)
+  const resetTag = process.env.RESET_ADMIN || '';
+  if (resetTag && settings.get('reset_admin_applied') !== resetTag) {
+    db.exec('DELETE FROM sessions; DELETE FROM users;');
+    settings.set('reset_admin_applied', resetTag);
+    console.log('Usuarios reiniciados: la app pedirá crear el administrador de nuevo.');
+  }
   const count = db.prepare('SELECT COUNT(*) n FROM users').get().n;
   if (count > 0) return;
   if (cfg.demo) {
