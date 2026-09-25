@@ -835,7 +835,10 @@ async function debugOrder(conn, order) {
 }
 
 // Subestados de Mercado Libre: ya se entregó al correo/agencia (en ML aparece "Seguir envío")
-const OUT_SUBSTATUS = ['dropped_off', 'picked_up', 'in_hub', 'in_transit', 'authorized_by_carrier', 'out_for_delivery'];
+const OUT_SUBSTATUS = ['dropped_off', 'picked_up', 'in_hub', 'in_packing_list', 'in_transit', 'authorized_by_carrier', 'out_for_delivery'];
+// ¿Ya salió? Mira el estado actual y también el historial (p. ej. entregado en agencia → en tránsito → "in_packing_list")
+const alreadyOut = sh => ['shipped', 'delivered', 'not_delivered'].includes(sh.status) ||
+  (sh.status === 'ready_to_ship' && (OUT_SUBSTATUS.includes(sh.substatus) || (sh.substatus_history || []).some(h => ['dropped_off', 'picked_up', 'in_hub'].includes(h.substatus))));
 // Aún no se puede imprimir (falta factura o autorización)
 const WAIT_SUBSTATUS = ['invoice_pending', 'waiting_for_carrier_authorization'];
 
@@ -863,9 +866,9 @@ async function buildFromShipment(conn, shipmentId, knownOrders = []) {
     sold_at: first.date_created || sh.date_created,
     items,
     // Lista para imprimir en Mercado Libre: "ready_to_ship" salvo que ya la entregaron al correo/agencia
-    labelReady: sh.status === 'ready_to_ship' && !OUT_SUBSTATUS.includes(sh.substatus) && !WAIT_SUBSTATUS.includes(sh.substatus),
+    labelReady: sh.status === 'ready_to_ship' && !alreadyOut(sh) && !WAIT_SUBSTATUS.includes(sh.substatus),
     cancelled: sh.status === 'cancelled' || orders.every(o => o.status === 'cancelled'),
-    shipped: ['shipped', 'delivered', 'not_delivered'].includes(sh.status) || (sh.status === 'ready_to_ship' && OUT_SUBSTATUS.includes(sh.substatus)),
+    shipped: alreadyOut(sh),
     meta: { status: sh.status, substatus: sh.substatus, buffered_until: sh.status === 'pending' && sh.substatus === 'buffered' ? (sh.shipping_option?.buffering?.date || null) : null, logistic, dispatch_by: await dispatchBy(conn, sh), customer: sh.receiver_address?.receiver_name || [first.buyer?.first_name, first.buyer?.last_name].filter(Boolean).join(' ') || first.buyer?.nickname || '' },
   };
 }
