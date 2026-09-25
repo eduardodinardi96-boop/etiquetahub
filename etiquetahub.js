@@ -1019,7 +1019,19 @@ async function fetchLabel(conn, order) {
   return buf;
 }
 
-module.exports = { test, listShipments, fetchLabel, normalize, orderItems };
+// Diagnóstico (solo admin): qué pedidos y estados entrega Falabella, sin datos personales
+async function debugList(conn) {
+  const after = new Date(Date.now() - 10 * 864e5).toISOString().replace(/\.\d{3}Z$/, '+00:00');
+  const b = await call(conn.creds, 'GetOrders', { CreatedAfter: after, Limit: '50', SortBy: 'created_at', SortDirection: 'DESC' });
+  const orders = arr(b.Orders?.Order);
+  const first = orders[0];
+  let items = null;
+  if (first) { try { items = (await orderItems(conn.creds, first.OrderId)).map(i => ({ Status: i.Status, ShippingType: i.ShippingType, PromisedShippingTime: i.PromisedShippingTime, keys: Object.keys(i) })); } catch (e) { items = { error: e.message }; } }
+  return { bodyKeys: Object.keys(b), ordersType: Array.isArray(b.Orders) ? 'array' : typeof b.Orders, count: orders.length,
+    orders: orders.map(o => ({ id: o.OrderId, created: o.CreatedAt, statuses: o.Statuses, keys: Object.keys(o).length })), firstItems: items };
+}
+
+module.exports = { debugList, test, listShipments, fetchLabel, normalize, orderItems };
 
 };
 
@@ -1843,11 +1855,17 @@ async function route(req, res) {
     if (p === '/api/admin/sellers' && m === 'GET') {
       const sellers = db.prepare('SELECT id, name, created_at FROM sellers ORDER BY name').all().map(s => ({
         ...s,
-        connections: db.prepare('SELECT marketplace, last_error, last_sync_at FROM connections WHERE seller_id=?').all(s.id),
+        connections: db.prepare('SELECT id, marketplace, last_error, last_sync_at FROM connections WHERE seller_id=?').all(s.id),
         blocked: db.prepare('SELECT COUNT(*) n FROM blocklist WHERE seller_id=?').get(s.id).n,
       }));
       const users = db.prepare('SELECT id, email, name, role, seller_id, must_change, (backup_hash IS NOT NULL) AS has_backup FROM users ORDER BY role, name').all();
       return ok(res, { sellers, users });
+    }
+    const dbc = p.match(/^\/api\/admin\/debug\/conn\/(\d+)$/);
+    if (dbc && m === 'GET') {
+      const c = db.prepare('SELECT * FROM connections WHERE id=?').get(Number(dbc[1]));
+      if (!c || !sync.connectors[c.marketplace].debugList) return fail(res, 404, 'Sin datos');
+      try { return ok(res, await sync.connectors[c.marketplace].debugList(sync.connObj(c))); } catch (e) { return fail(res, 500, e.message); }
     }
     const dbg = p.match(/^\/api\/admin\/debug\/order\/(\d+)$/);
     if (dbg && m === 'GET') {
