@@ -1791,7 +1791,7 @@ async function route(req, res) {
   if (lab && m === 'GET') {
     const o = db.prepare('SELECT * FROM orders WHERE id=?').get(Number(lab[1]));
     if (!o || (user.role === 'seller' && o.seller_id !== user.seller_id)) return fail(res, 404, 'Pedido no encontrado');
-    if (sync.isBlocked(o)) return fail(res, 403, 'Etiqueta bloqueada: primero desbloquéala');
+    if (o.state === 'ready' && sync.isBlocked(o)) return fail(res, 403, 'Etiqueta bloqueada: primero desbloquéala');
     if (!['ready', 'printed', 'shipped'].includes(o.state)) return fail(res, 409, 'La etiqueta aún no está lista');
     if (!o.label_file || !fs.existsSync(sync.labelPath(o.id))) {
       // Descargarla la marca como impresa en Mercado Libre: solo se descarga al imprimir
