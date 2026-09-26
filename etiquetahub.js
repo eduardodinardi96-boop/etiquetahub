@@ -171,7 +171,8 @@ CREATE TABLE IF NOT EXISTS sale_items (
   amount REAL NOT NULL DEFAULT 0,
   PRIMARY KEY (marketplace, order_id, line)
 ); CREATE INDEX IF NOT EXISTS sale_items_day ON sale_items (seller_id, day);
-CREATE TABLE IF NOT EXISTS sales_sync (connection_id INTEGER PRIMARY KEY, backfilled_to TEXT);`);
+CREATE TABLE IF NOT EXISTS sales_sync (connection_id INTEGER PRIMARY KEY, backfilled_to TEXT);
+CREATE TABLE IF NOT EXISTS item_family (marketplace TEXT NOT NULL, pub_id TEXT NOT NULL, family TEXT, fetched_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (marketplace, pub_id));`);
 
 // Migraciones simples (columnas nuevas)
 for (const [t, c, def] of [['users', 'must_change', 'INTEGER NOT NULL DEFAULT 0'], ['sessions', 'impersonator_id', 'INTEGER'], ['users', 'backup_hash', 'TEXT'], ['orders', 'block_no', 'INTEGER'], ['orders', 'unblocked_at', 'TEXT'], ['orders', 'unblocked_by', 'TEXT']]) {
@@ -1006,7 +1007,23 @@ async function sales(conn, fromISO, toISO) {
   return out;
 }
 
-module.exports = { sales, debugOrder, refresh, authUrl, exchangeCode, whoAmI, listShipments, fetchLabel, fromNotification };
+// "Familia" de cada publicación: con el modelo nuevo de Mercado Libre (User Products) cada variante es una publicación
+// distinta (otro MLC…), pero todas comparten family_name. Sirve para agruparlas como una sola.
+async function families(conn, ids) {
+  const out = {};
+  for (let i = 0; i < ids.length; i += 20) {
+    const chunk = ids.slice(i, i + 20);
+    const r = await api(conn, `/items?ids=${chunk.join(',')}&attributes=id,title,family_name,user_product_id`);
+    for (const x of Array.isArray(r) ? r : []) {
+      const b = x.body || {};
+      if (b.id) out[b.id] = { family: b.family_name || '', up: b.user_product_id || '' };
+    }
+    for (const id of chunk) if (!out[id]) out[id] = { family: '', up: '' };
+  }
+  return out;
+}
+
+module.exports = { families, sales, debugOrder, refresh, authUrl, exchangeCode, whoAmI, listShipments, fetchLabel, fromNotification };
 
 };
 
@@ -1630,6 +1647,16 @@ async function refresh(force = false) {
           saveWindow(row, list, localDay(new Date(start.getTime() + 864e5)), localDay(new Date(to.getTime() - 864e5)));
           db.prepare('UPDATE sales_sync SET backfilled_to=? WHERE connection_id=?').run(start.toISOString(), row.id);
         }
+        // familias de las publicaciones de Mercado Libre (para agrupar variantes que son publicaciones separadas)
+        if (row.marketplace === 'ml' && c.families) {
+          const ids = db.prepare(`SELECT DISTINCT i.pub_id FROM sale_items i LEFT JOIN item_family f ON f.marketplace='ml' AND f.pub_id=i.pub_id
+            WHERE i.marketplace='ml' AND i.seller_id=? AND i.pub_id<>'' AND f.pub_id IS NULL LIMIT 3000`).all(row.seller_id).map(r => r.pub_id);
+          if (ids.length) {
+            const fam = await c.families(conn, ids);
+            const ins = db.prepare("INSERT OR REPLACE INTO item_family (marketplace, pub_id, family) VALUES ('ml',?,?)");
+            for (const [id, f] of Object.entries(fam)) ins.run(id, f.family || '');
+          }
+        }
       } catch (e) { console.warn('[ventas]', row.marketplace, row.seller_id, e.message); }
     }
     const old = localDay(new Date(now - KEEP_DAYS * 864e5));
@@ -1653,27 +1680,43 @@ function summary(sellerId) {
   return { days, today: today(), series, connected: conns, updatedAt: lastRun || null };
 }
 
+// Título sin colores ni tallas: "Camiseta Niña … Negro 3/4años" y "… Blanco 13/14 Años" quedan iguales
+const COLORS = 'negro negra blanco blanca rojo roja azul marino oscuro oscura claro clara gris grafito rosa rosado rosada verde amarillo amarilla morado morada lila celeste beige cafe café chocolate burdeo burdeos fucsia naranjo naranja crema mostaza vino turquesa menta lavanda coral durazno salmon salmón palo hueso perla plomo jaspeado jaspeada melange caqui khaki camel arena terracota petroleo petróleo calipso multicolor dorado plateado'.split(' ');
+const SIZE = /^(xxs|xs|s|m|l|xl|xxl|xxxl|xxxxl|[2-5]xl|\d{1,2}(\/\d{1,2})?|\d{1,2}-\d{1,2}|talla|tallas|t|años|anos|año|meses|unica|única|u|xl-xxl|s-m|l-xl|m-l)$/;
+function baseTitle(t) {
+  const words = String(t || '').split(/\s+/).filter(Boolean);
+  const keep = words.filter(w => { const x = w.toLowerCase().replace(/[.,;:()]/g, '').replace(/(años|anos)$/, ''); return x && !COLORS.includes(x) && !SIZE.test(x); });
+  return keep.join(' ');
+}
+
 // Planilla de productos vendidos entre dos días (incluidos)
 function products(sellerId, from, to) {
   const args = [from, to]; let where = 'day >= ? AND day <= ?';
   if (sellerId) { where += ' AND i.seller_id = ?'; args.push(sellerId); }
-  const rows = db.prepare(`SELECT i.*, s.name seller FROM sale_items i LEFT JOIN sellers s ON s.id = i.seller_id WHERE ${where}`).all(...args);
+  const rows = db.prepare(`SELECT i.*, s.name seller, f.family FROM sale_items i LEFT JOIN sellers s ON s.id = i.seller_id
+    LEFT JOIN item_family f ON f.marketplace = i.marketplace AND f.pub_id = i.pub_id WHERE ${where}`).all(...args);
   // Se agrupa por publicación (en Mercado Libre, el ID MLC… que comparte todas sus variantes); dentro, por variante
   const pubs = new Map();
   const blank = () => ({ qty: 0, amount: 0, orders: new Set(), byMk: { ml: 0, fa: 0, pa: 0 }, byDay: {} });
   const add = (x, r) => { x.qty += r.qty; x.amount += r.amount; x.orders.add(r.marketplace + r.order_id); x.byMk[r.marketplace] = (x.byMk[r.marketplace] || 0) + r.qty; x.byDay[r.day] = (x.byDay[r.day] || 0) + r.qty; };
   for (const r of rows) {
-    const pkey = `${r.seller_id}|${r.marketplace}|${r.marketplace === 'ml' && r.pub_id ? r.pub_id : (r.name || '').trim().toUpperCase()}`;
-    if (!pubs.has(pkey)) pubs.set(pkey, { ...blank(), seller: r.seller || '', marketplace: r.marketplace, pub_id: r.pub_id || '', name: r.name, variants: new Map() });
-    const p = pubs.get(pkey); add(p, r);
+    // Mercado Libre: se agrupa por familia (variantes publicadas por separado) y si no hay, por publicación (MLC…)
+    // si Mercado Libre no entrega familia, se agrupan los títulos que solo cambian en color o talla
+    const fam = r.marketplace === 'ml' ? baseTitle(r.family || r.name) || r.name : '';
+    const pkey = `${r.seller_id}|${r.marketplace}|${fam ? 'FAM:' + fam.toUpperCase() : r.marketplace === 'ml' && r.pub_id ? r.pub_id : (r.name || '').trim().toUpperCase()}`;
+    if (!pubs.has(pkey)) pubs.set(pkey, { ...blank(), seller: r.seller || '', marketplace: r.marketplace, pub_id: r.pub_id || '', pubIds: new Set(), name: fam || r.name, variants: new Map() });
+    const p = pubs.get(pkey); add(p, r); if (r.pub_id) p.pubIds.add(r.pub_id);
     // la misma variante puede venir con los atributos en distinto orden ("Talla · Color" / "Color · Talla"): se ordenan
-    const vkey = (r.variant || '').split('·').map(x => x.trim().toUpperCase()).filter(Boolean).sort().join('|') + '|' + (r.sku || '').toUpperCase();
-    if (!p.variants.has(vkey)) p.variants.set(vkey, { ...blank(), variant: r.variant || '', sku: r.sku || '' });
+    // si la variante es una publicación aparte (familia), se muestra su título y su MLC
+    const extra = fam ? String(r.name || '').split(/\s+/).filter(w => !baseTitle(w)).join(' ') : ''; // lo que distingue a esta publicación: color / talla
+    const vlabel = r.variant || extra || (fam && fam !== r.name ? r.name : '');
+    const vkey = (vlabel || '').split('·').map(x => x.trim().toUpperCase()).filter(Boolean).sort().join('|') + '|' + (r.sku || '').toUpperCase() + (fam ? '|' + r.pub_id : '');
+    if (!p.variants.has(vkey)) p.variants.set(vkey, { ...blank(), variant: vlabel, sku: r.sku || (fam ? r.pub_id : '') || '' });
     add(p.variants.get(vkey), r);
   }
   const fin = x => ({ ...x, orders: x.orders.size, amount: Math.round(x.amount) });
   const byQty = (a, b) => b.qty - a.qty || b.amount - a.amount;
-  const list = [...pubs.values()].map(p => ({ ...fin(p), variants: [...p.variants.values()].map(fin).sort(byQty) })).sort(byQty);
+  const list = [...pubs.values()].map(p => ({ ...fin(p), pubIds: undefined, pub_id: p.pubIds.size > 1 ? `${p.pubIds.size} publicaciones` : p.pub_id, variants: [...p.variants.values()].map(fin).sort(byQty) })).sort(byQty);
   // desde qué día hay historial completo
   const conns = db.prepare(`SELECT c.id FROM connections c WHERE c.marketplace IN ('ml','fa','pa') ${sellerId ? 'AND c.seller_id = ?' : ''}`).all(...(sellerId ? [sellerId] : []));
   let since = today();
