@@ -1709,9 +1709,12 @@ function products(sellerId, from, to) {
     // la misma variante puede venir con los atributos en distinto orden ("Talla · Color" / "Color · Talla"): se ordenan
     // si la variante es una publicación aparte (familia), se muestra su título y su MLC
     const extra = fam ? String(r.name || '').split(/\s+/).filter(w => !baseTitle(w)).join(' ') : ''; // lo que distingue a esta publicación: color / talla
-    const vlabel = r.variant || extra || (fam && fam !== r.name ? r.name : '');
-    const vkey = (vlabel || '').split('·').map(x => x.trim().toUpperCase()).filter(Boolean).sort().join('|') + '|' + (r.sku || '').toUpperCase() + (fam ? '|' + r.pub_id : '');
-    if (!p.variants.has(vkey)) p.variants.set(vkey, { ...blank(), variant: vlabel, sku: r.sku || (fam ? r.pub_id : '') || '' });
+    // variante = atributos de Mercado Libre + lo que dice el título y no está en los atributos (p. ej. la talla "13/14 Años")
+    const low = String(r.variant || '').toLowerCase();
+    const extraNew = extra.split(/\s+/).filter(w => w && !low.includes(w.toLowerCase())).join(' ');
+    const vlabel = [r.variant, extraNew].filter(Boolean).join(' · ') || (fam && fam !== r.name ? r.name : '');
+    const vkey = (vlabel || '').split('·').map(x => x.trim().toUpperCase()).filter(Boolean).sort().join('|') + '|' + (r.sku || '').toUpperCase();
+    if (!p.variants.has(vkey)) p.variants.set(vkey, { ...blank(), variant: vlabel, sku: r.sku || r.pub_id || '' });
     add(p.variants.get(vkey), r);
   }
   const fin = x => ({ ...x, orders: x.orders.size, amount: Math.round(x.amount) });
