@@ -1660,7 +1660,9 @@ function products(sellerId, from, to) {
   const rows = db.prepare(`SELECT i.*, s.name seller FROM sale_items i LEFT JOIN sellers s ON s.id = i.seller_id WHERE ${where}`).all(...args);
   const map = new Map();
   for (const r of rows) {
-    const key = `${r.seller_id}|${(r.sku || r.name).trim().toUpperCase()}|${(r.variant || '').trim().toUpperCase()}`;
+    // la misma variante puede venir con los atributos en distinto orden ("Talla · Color" / "Color · Talla"): se ordenan
+    const vkey = (r.variant || '').split('·').map(x => x.trim().toUpperCase()).filter(Boolean).sort().join('|');
+    const key = `${r.seller_id}|${(r.sku || r.name).trim().toUpperCase()}|${vkey}`;
     if (!map.has(key)) map.set(key, { seller: r.seller || '', sku: r.sku || r.pub_id || '', name: r.name, variant: r.variant || '', qty: 0, amount: 0, orders: new Set(), byMk: { ml: 0, fa: 0, pa: 0 }, byDay: {} });
     const x = map.get(key);
     x.qty += r.qty; x.amount += r.amount; x.orders.add(r.marketplace + r.order_id);
