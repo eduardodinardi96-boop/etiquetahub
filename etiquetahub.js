@@ -635,6 +635,20 @@ function drawStrip(page, fonts, blocks, info, stripH, cont) {
   page.drawText(foot.slice(0, 70), { x: PAD, y: PAD, size: 7, font: fonts.reg, color: rgb(0.2, 0.2, 0.2) });
 }
 
+// Franja negra arriba de la etiqueta: "MERCADO LIBRE · FLEX" a la izquierda y el vendedor a la derecha
+function drawHeaderBand(page, fonts, info, h) {
+  const white = rgb(1, 1, 1);
+  page.drawRectangle({ x: 0, y: PAGE_H - h, width: PAGE_W, height: h, color: rgb(0, 0, 0) });
+  const left = safeText(fonts.bold, [MK_NAME[info.marketplace] || '', info.shipType ? String(info.shipType).toUpperCase() : ''].filter(Boolean).join(' · '));
+  const right = safeText(fonts.bold, String(info.seller || '').toUpperCase());
+  let size = 10.5;
+  const fits = sz => fonts.bold.widthOfTextAtSize(left, sz) + fonts.bold.widthOfTextAtSize(right, sz) + 14 <= PAGE_W - PAD * 2;
+  while (!fits(size) && size > 6) size -= 0.5;
+  const y = PAGE_H - h + (h - size * 0.72) / 2;
+  page.drawText(left, { x: PAD, y, size, font: fonts.bold, color: white });
+  page.drawText(right, { x: PAGE_W - PAD - fonts.bold.widthOfTextAtSize(right, size), y, size, font: fonts.bold, color: white });
+}
+
 // Hoja de detalle del pedido (segunda página, 100x150 mm)
 function drawOrderSheet(page, fonts, blocks, info, part, parts) {
   const black = rgb(0, 0, 0), grey = rgb(0.3, 0.3, 0.3);
@@ -720,7 +734,9 @@ async function stampLabel(originalBytes, info) {
   const stripH = mode === 'strip' ? Math.max(used, 26 * MM) : 0;
 
   const crop = parseCrop(cfg.crop[info.marketplace]);
-  const pages = src.getPages();
+  // Mercado Libre agrega una hoja propia con el detalle: se deja solo la etiqueta (la hoja de detalle es la nuestra)
+  const pages = info.marketplace === 'ml' && mode !== 'strip' ? src.getPages().slice(0, 1) : src.getPages();
+  const HEAD_H = 6.5 * MM; // franja superior: marketplace · tipo de envío · vendedor
   const auto = crop ? [] : await autoBoxes(originalBytes, pages.length).catch(() => []);
   for (let i = 0; i < pages.length; i++) {
     let box = crop;
@@ -736,18 +752,19 @@ async function stampLabel(originalBytes, info) {
     }
     const emb = await out.embedPage(pages[i], box || undefined);
     const page = out.addPage([PAGE_W, PAGE_H]);
-    const areaW = PAGE_W - 2, areaH = PAGE_H - stripH - 2;
+    const areaW = PAGE_W - 2, areaH = PAGE_H - stripH - 2 - HEAD_H;
     const w = emb.width, h = emb.height;
     const sNormal = Math.min(areaW / w, areaH / h);
     const sRot = Math.min(areaW / h, areaH / w);
     if (sRot > sNormal * 1.15) {
       const dw = h * sRot, dh = w * sRot;
-      const x = (PAGE_W - dw) / 2 + dw, y = PAGE_H - 1 - dh;
+      const x = (PAGE_W - dw) / 2 + dw, y = PAGE_H - HEAD_H - 1 - dh;
       page.drawPage(emb, { x, y, xScale: sRot, yScale: sRot, rotate: degrees(90) });
     } else {
       const dw = w * sNormal, dh = h * sNormal;
-      page.drawPage(emb, { x: (PAGE_W - dw) / 2, y: PAGE_H - 1 - dh, xScale: sNormal, yScale: sNormal });
+      page.drawPage(emb, { x: (PAGE_W - dw) / 2, y: PAGE_H - HEAD_H - 1 - dh, xScale: sNormal, yScale: sNormal });
     }
+    drawHeaderBand(page, fonts, info, HEAD_H);
     if (i === 0 && mode === 'strip') drawStrip(page, fonts, first, info, stripH, false);
   }
   if (mode !== 'strip') {
@@ -1325,6 +1342,7 @@ function fetchLabelFile(orderId) {
     const missing = new Set(blockedBy(order).map(h => h.index));
     const stamped = await stampLabel(original, {
       blockNo: order.block_no || null,
+      shipType: (() => { const m = JSON.parse(order.meta || '{}'); return ({ self_service: 'Flex', cross_docking: 'Colecta', drop_off: 'Agencia', xd_drop_off: 'Agencia' })[m.logistic] || m.carrier || ''; })(),
       items: JSON.parse(order.items).map((it, i) => ({ ...it, missing: missing.has(i) })), seller: seller?.name || '', marketplace: order.marketplace, orderNumber: order.order_number,
       customer: JSON.parse(order.meta || '{}').customer || '',
     });
