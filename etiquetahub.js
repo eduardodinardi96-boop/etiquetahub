@@ -452,7 +452,7 @@ function snapshot() {
   db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
   const plain = fs.readFileSync(tmp);
   fs.unlinkSync(tmp);
-  return { plain, enc: encryptBuf(plain), hash: crypto.createHash('sha256').update(plain).digest('hex') };
+  return { plain, enc: encryptBuf(require('zlib').gzipSync(plain, { level: 6 })), hash: crypto.createHash('sha256').update(plain).digest('hex') };
 }
 
 async function gh(method, url, body) {
@@ -1964,7 +1964,7 @@ async function route(req, res) {
     const tmp = path.join(require('os').tmpdir(), `eh-backup-${Date.now()}.db`);
     db.exec(`VACUUM INTO '${tmp.replace(/'/g, "''")}'`);
     const plain = fs.readFileSync(tmp);
-    const enc = encryptBuf(plain);
+    const enc = encryptBuf(require('zlib').gzipSync(plain, { level: 6 })); // comprimido: el respaldo ocupa ~5 veces menos
     res.setHeader('x-plain-hash', require('crypto').createHash('sha256').update(plain).digest('hex'));
     fs.unlinkSync(tmp);
     return send(res, 200, enc, { 'content-type': 'application/octet-stream' });
@@ -2520,7 +2520,8 @@ async function restore() {
     let res = slug ? await fetch(`https://api.github.com/repos/${slug}/contents/db.enc?ref=backup`, { headers: { accept: 'application/vnd.github.raw', 'user-agent': 'etiquetahub' }, signal: AbortSignal.timeout(20000) }).catch(() => null) : null;
     if (!res || !res.ok) res = await fetch(`${cfg.backupUrl}?t=${Date.now()}`, { signal: AbortSignal.timeout(20000) });
     if (!res.ok) { console.log(`Sin respaldo previo (${res.status}); se parte con base nueva.`); return; }
-    const plain = decryptBuf(Buffer.from(await res.arrayBuffer()));
+    let plain = decryptBuf(Buffer.from(await res.arrayBuffer()));
+    if (plain[0] === 0x1f && plain[1] === 0x8b) plain = require('zlib').gunzipSync(plain); // respaldo comprimido
     fs.writeFileSync(dbFile, plain);
     console.log(`Respaldo recuperado (${plain.length} bytes).`);
   } catch (e) {
