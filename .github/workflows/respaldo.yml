@@ -1,29 +1,78 @@
 name: Respaldo EtiquetaHub
+
+# Cada 15 minutos guarda el último respaldo (rama "backup", una sola copia)
+# y además una copia por día de los últimos 7 días (rama "backup-diario").
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: '*/15 * * * *'
   workflow_dispatch:
+
 permissions:
   contents: write
+
+concurrency:
+  group: respaldo
+  cancel-in-progress: false
+
 env:
   APP_URL: https://etiquetahub-javi.onrender.com
+  KEEP_DAYS: 7
+
 jobs:
   respaldo:
     runs-on: ubuntu-latest
     steps:
-      - name: Descargar respaldo cifrado y guardarlo en la rama "backup"
+      - name: Descargar respaldo cifrado de la app
         run: |
           set -e
-          curl -fsS --retry 3 --max-time 90 -D headers.txt "$APP_URL/backup.enc" -o db.enc
-          HASH=$(grep -i '^x-plain-hash:' headers.txt | awk '{print $2}' | tr -d '\r')
-          git init -q repo && cd repo
-          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-          if git fetch -q --depth 1 origin backup 2>/dev/null; then git checkout -q FETCH_HEAD -- hash.txt 2>/dev/null || true; fi
-          if [ -f hash.txt ] && [ "$(cat hash.txt)" = "$HASH" ]; then echo "Sin cambios"; exit 0; fi
-          git checkout -q --orphan backup
-          git rm -rfq . 2>/dev/null || true
-          cp ../db.enc db.enc && echo "$HASH" > hash.txt
+          curl -sf --retry 4 --retry-delay 15 --max-time 180 -D headers.txt -o db.enc "$APP_URL/backup.enc"
+          HASH=$(grep -i '^x-plain-hash:' headers.txt | awk '{print $2}' | tr -d '\r\n')
+          SIZE=$(stat -c %s db.enc)
+          if [ "$SIZE" -lt 1000 ]; then echo "Respaldo demasiado chico ($SIZE bytes), se omite"; exit 1; fi
+          echo "HASH=$HASH" >> "$GITHUB_ENV"
+          echo "Respaldo descargado: $SIZE bytes"
+
+      - name: Configurar git
+        run: |
+          git config --global user.name "respaldo-etiquetahub"
+          git config --global user.email "respaldo@etiquetahub.local"
+          echo "REPO=https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git" >> "$GITHUB_ENV"
+
+      - name: Último respaldo (rama backup)
+        run: |
+          set -e
+          PREV=""
+          if git clone -q --depth 1 --branch backup "$REPO" prev 2>/dev/null; then PREV=$(cat prev/hash.txt 2>/dev/null || true); fi
+          if [ -n "$HASH" ] && [ "$HASH" = "$PREV" ]; then
+            echo "Sin cambios desde el último respaldo"; echo "CHANGED=0" >> "$GITHUB_ENV"; exit 0
+          fi
+          echo "CHANGED=1" >> "$GITHUB_ENV"
+          rm -rf out && mkdir out && cd out
+          git init -q -b backup
+          cp ../db.enc db.enc
+          echo -n "$HASH" > hash.txt
           git add db.enc hash.txt
-          git -c user.name="respaldo" -c user.email="respaldo@users.noreply.github.com" commit -qm "Respaldo $(date -u +%FT%TZ)"
-          git push -qf origin backup
-          echo "Respaldo guardado"
+          git commit -q -m "Respaldo $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          git push -q -f "$REPO" backup
+
+      - name: Copia diaria de los últimos 7 días (rama backup-diario)
+        run: |
+          set -e
+          DAY=$(TZ=America/Santiago date +%F)
+          rm -rf daily && mkdir daily
+          if git clone -q --depth 1 --branch backup-diario "$REPO" dprev 2>/dev/null; then cp dprev/*.enc daily/ 2>/dev/null || true; fi
+          # si el día de hoy ya tiene copia y nada cambió, no se hace nada
+          if [ "$CHANGED" = "0" ] && [ -f "daily/$DAY.enc" ]; then echo "Copia de hoy al día"; exit 0; fi
+          cp db.enc "daily/$DAY.enc"      # la copia de hoy se va actualizando; al pasar la medianoche queda fija
+          LIMIT=$(TZ=America/Santiago date -d "-$((KEEP_DAYS-1)) days" +%F)
+          for f in daily/*.enc; do
+            d=$(basename "$f" .enc)
+            if [[ "$d" < "$LIMIT" ]]; then echo "Se borra copia antigua $d"; rm -f "$f"; fi
+          done
+          cd daily
+          ls -1 *.enc | sed 's/\.enc$//' | sort -r > dias.txt
+          echo "Copias guardadas:"; cat dias.txt
+          git init -q -b backup-diario
+          git add .
+          git commit -q -m "Copias diarias al $DAY ($(wc -l < dias.txt) días)"
+          git push -q -f "$REPO" backup-diario
