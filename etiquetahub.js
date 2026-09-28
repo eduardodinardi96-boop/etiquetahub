@@ -1985,11 +1985,9 @@ function orderView(o, user) {
   const blocked = sync.blockedBy(o);
   const seller = db.prepare('SELECT name FROM sellers WHERE id=?').get(o.seller_id);
   const meta = JSON.parse(o.meta || '{}');
-  const own = user.role !== 'seller' || o.seller_id === user.seller_id;
-  // Atrasada: no ha salido y ya pasó el plazo real del marketplace (o Mercado Libre la marca atrasada)
-  const openSt = !['shipped', 'cancelled'].includes(o.state);
-  const deadline = meta.dispatch_by ? new Date(String(meta.dispatch_by).includes('T') ? meta.dispatch_by : String(meta.dispatch_by).replace(' ', 'T')) : null;
-  const late = openSt && (meta.ml_delayed === true || Boolean(deadline && !isNaN(deadline) && deadline < new Date())); // un vendedor ve todo, pero solo actúa sobre lo suyo
+  const own = user.role !== 'seller' || o.seller_id === user.seller_id; // un vendedor ve todo, pero solo actúa sobre lo suyo
+  // Atrasada: no ha salido y ya pasó el horario límite real de entrega de cada canal
+  const late = isLate(o, meta);
   return {
     own,
     id: o.id, seller_id: o.seller_id, seller: seller?.name || '', marketplace: o.marketplace, order_number: o.order_number,
@@ -1999,13 +1997,48 @@ function orderView(o, user) {
     blocked_skus: blocked.map(b => (b.sku || b.pub_id)), missing_idx: blocked.map(b => b.index), label_at: o.label_at, printed_at: o.printed_at, printed_by: o.printed_by,
     error: (user.role === 'seller' && own) || user.role === 'admin' ? o.error : (o.state === 'error' ? 'No se pudo obtener la etiqueta' : o.error),
     carrier: meta.carrier || null, dispatch_by: dispatchView(o.marketplace, meta.dispatch_by), dispatch_mk: o.marketplace === 'fa' ? meta.dispatch_by || null : null, ship_type: ({ self_service: 'Flex', cross_docking: 'Colecta', drop_off: 'Agencia', xd_drop_off: 'Agencia', fulfillment: 'Full' })[meta.logistic] || null, customer: meta.customer || '', tracking: meta.tracking || null, track_url: own ? trackUrl(o, meta, user) : null,
-    late, late_ml: late && meta.ml_delayed === true, deadline: late ? meta.dispatch_by : null,
+    late, late_ml: late && meta.ml_delayed === true, deadline: late ? lateDeadline(o.marketplace, meta)?.toISOString() : null,
   };
 }
 
 // Quién imprimió: "Vendedor · Tienda", "Fulfillment · Nombre" o "Administrador · Nombre"
 // Paris informa como plazo "fecha de compra + 72 h", así que la hora es la de la compra (8:23, 11:13…), no un horario de corte real.
 // Para Paris mostramos solo el día (hora local de Chile), sin hora.
+// Hora de Chile -> instante real (considera horario de verano/invierno)
+function chileAt(day, hhmmss) {
+  const [y, m, d] = day.split('-').map(Number), [h, mi, se] = hhmmss.split(':').map(Number);
+  const guess = Date.UTC(y, m - 1, d, h, mi, se || 0);
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(guess)).map(x => [x.type, x.value]));
+  const asLocal = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+  return new Date(guess - (asLocal - guess));
+}
+const chileDay = d => new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+const parseD = v => { if (!v) return null; const d = new Date(String(v).includes('T') ? v : String(v).replace(' ', 'T')); return isNaN(d) ? null : d; };
+// Día de despacho de Paris: se usa el día que informa Paris (el más tardío entre su fecha y la fecha en hora de Chile)
+function parisDay(v) {
+  const d = parseD(v); const raw = String(v).slice(0, 10);
+  if (!d) return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : null;
+  const cl = chileDay(d);
+  return /^\d{4}-\d{2}-\d{2}$/.test(raw) && raw > cl ? raw : cl;
+}
+// Horario límite real de entrega:
+//  - Paris: hasta las 23:59 del día de despacho
+//  - Flex (Mercado Libre): hasta las 23:00 del día de despacho
+//  - Agencia/Colecta ML y Falabella: el horario que informa el marketplace
+function lateDeadline(mk, meta) {
+  const v = meta.dispatch_by; if (!v) return null;
+  if (mk === 'pa') { const day = parisDay(v); return day ? chileAt(day, '23:59:59') : null; }
+  const d = parseD(v); if (!d) return null;
+  if (mk === 'ml' && meta.logistic === 'self_service') return chileAt(chileDay(d), '23:00:00');
+  return d;
+}
+function isLate(o, meta) {
+  if (['shipped', 'cancelled'].includes(o.state)) return false;
+  // cancelada en el marketplace (aunque ya estuviera impresa) no es atrasada
+  if (meta.status === 'cancelled' || meta.cancelled) return false;
+  const dl = lateDeadline(o.marketplace, meta);
+  return Boolean(dl && dl < new Date());
+}
 function dispatchView(mk, v) {
   if (!v) return null;
   if (mk === 'fa') {
@@ -2017,10 +2050,8 @@ function dispatchView(mk, v) {
     return d.toISOString().slice(0, 10) + ' ' + m[4];
   }
   if (mk !== 'pa') return v;
-  const d = new Date(String(v).includes('T') ? v : String(v).replace(' ', 'T'));
-  if (isNaN(d)) return v;
-  const day = new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
-  return day + ' 23:59:00';
+  const day = parisDay(v);
+  return day ? day + ' 23:59:00' : v;
 }
 function printedByLabel(user) {
   if (user.role === 'seller') return `Vendedor · ${db.prepare('SELECT name FROM sellers WHERE id=?').get(user.seller_id)?.name || user.name}`;
