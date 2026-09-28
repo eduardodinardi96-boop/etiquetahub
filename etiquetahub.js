@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS sales_sync (connection_id INTEGER PRIMARY KEY, backfi
 CREATE TABLE IF NOT EXISTS item_family (marketplace TEXT NOT NULL, pub_id TEXT NOT NULL, family TEXT, fetched_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (marketplace, pub_id));`);
 
 // Migraciones simples (columnas nuevas)
-for (const [t, c, def] of [['users', 'must_change', 'INTEGER NOT NULL DEFAULT 0'], ['sessions', 'impersonator_id', 'INTEGER'], ['users', 'backup_hash', 'TEXT'], ['orders', 'block_no', 'INTEGER'], ['orders', 'unblocked_at', 'TEXT'], ['orders', 'unblocked_by', 'TEXT'], ['item_family', 'family_id', 'TEXT'], ['item_family', 'up_id', 'TEXT']]) {
+for (const [t, c, def] of [['users', 'must_change', 'INTEGER NOT NULL DEFAULT 0'], ['sessions', 'impersonator_id', 'INTEGER'], ['users', 'backup_hash', 'TEXT'], ['orders', 'block_no', 'INTEGER'], ['orders', 'unblocked_at', 'TEXT'], ['orders', 'unblocked_by', 'TEXT'], ['orders', 'unprinted_at', 'TEXT'], ['item_family', 'family_id', 'TEXT'], ['item_family', 'up_id', 'TEXT']]) {
   const cols = db.prepare(`PRAGMA table_info(${t})`).all().map(x => x.name);
   if (!cols.includes(c)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${def}`);
 }
@@ -1564,9 +1564,10 @@ async function upsert(conn, s) {
     if (!existing.printed_at) db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by=? WHERE id=?`).run(existing.label_at ? 'EtiquetaHub' : (mk === 'ml' ? 'Mercado Libre' : 'Marketplace'), existing.id);
   }
   // Si la imprimieron en Mercado Libre (y no fue la app la que la descargó), pasa a impresa
-  if (printedOutside && ['ready', 'waiting', 'error'].includes(state) && !existing.label_at) {
+  // Mercado Libre dice que la etiqueta ya se imprimió: pasa a impresa (salvo que alguien la haya marcado "no impresa" a mano)
+  if (printedOutside && ['ready', 'waiting', 'error'].includes(state) && !existing.unprinted_at) {
     state = 'printed';
-    db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by='Mercado Libre' WHERE id=?`).run(existing.id);
+    db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by=? WHERE id=?`).run(existing.label_at ? 'EtiquetaHub' : 'Mercado Libre', existing.id);
   }
   db.prepare(`UPDATE orders SET items=?, meta=?, state=?, updated_at=datetime('now') WHERE id=?`)
     .run(JSON.stringify(s.items), JSON.stringify(s.meta || {}), state, existing.id);
@@ -2330,7 +2331,7 @@ async function route(req, res) {
     const o = db.prepare('SELECT * FROM orders WHERE id=?').get(Number(ret[1]));
     if (!o || (user.role === 'seller' && ret[2] === 'unprint' && o.seller_id !== user.seller_id)) return fail(res, 404, 'Pedido no encontrado');
     if (ret[2] === 'unprint') {
-      db.prepare("UPDATE orders SET state='ready', printed_at=NULL, printed_by=NULL WHERE id=?").run(o.id);
+      db.prepare("UPDATE orders SET state='ready', printed_at=NULL, printed_by=NULL, unprinted_at=datetime('now') WHERE id=?").run(o.id);
       sync.bus.emit('change', { type: 'order', orderId: o.id, sellerId: o.seller_id });
       return ok(res);
     }
@@ -2661,7 +2662,21 @@ async function restore() {
   const dbFile = path.join(cfg.dataDir, 'etiquetahub.db');
   if (fs.existsSync(dbFile) || !cfg.backupUrl) return;
   try {
-    // Preferimos la API de GitHub (sin caché); si falla, el enlace raw
+    // 1) Durante una publicación, la versión anterior sigue atendiendo en la URL pública: se copia su base
+    //    (así no se pierde lo impreso en los minutos desde el último respaldo de GitHub).
+    try {
+      const live = await fetch(`${cfg.baseUrl}/backup.enc?t=${Date.now()}`, { signal: AbortSignal.timeout(15000) });
+      if (live.ok) {
+        let plain = decryptBuf(Buffer.from(await live.arrayBuffer()));
+        if (plain[0] === 0x1f && plain[1] === 0x8b) plain = require('zlib').gunzipSync(plain);
+        if (plain.slice(0, 15).toString() === 'SQLite format 3') {
+          fs.writeFileSync(dbFile, plain);
+          console.log(`Base copiada de la versión en línea (${plain.length} bytes).`);
+          return;
+        }
+      }
+    } catch (e) { console.log('Sin versión en línea para copiar:', e.message); }
+    // 2) Respaldo de GitHub: preferimos la API (sin caché); si falla, el enlace raw
     const slug = process.env.RENDER_GIT_REPO_SLUG;
     let res = slug ? await fetch(`https://api.github.com/repos/${slug}/contents/db.enc?ref=backup`, { headers: { accept: 'application/vnd.github.raw', 'user-agent': 'etiquetahub' }, signal: AbortSignal.timeout(20000) }).catch(() => null) : null;
     if (!res || !res.ok) res = await fetch(`${cfg.backupUrl}?t=${Date.now()}`, { signal: AbortSignal.timeout(20000) });
