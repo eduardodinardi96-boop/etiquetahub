@@ -971,8 +971,9 @@ async function buildFromShipment(conn, shipmentId, knownOrders = []) {
     // Lista para imprimir en Mercado Libre: "ready_to_ship" salvo que ya la entregaron al correo/agencia
     labelReady: sh.status === 'ready_to_ship' && !alreadyOut(sh) && !WAIT_SUBSTATUS.includes(sh.substatus),
     cancelled: sh.status === 'cancelled' || orders.every(o => o.status === 'cancelled'),
-    shipped: alreadyOut(sh),
-    meta: { status: sh.status, substatus: sh.substatus, buffered_until: sh.status === 'pending' && sh.substatus === 'buffered' ? (sh.shipping_option?.buffering?.date || null) : null, logistic, dispatch_by: dBy, ml_delayed: mlDelayed, customer: sh.receiver_address?.receiver_name || [first.buyer?.first_name, first.buyer?.last_name].filter(Boolean).join(' ') || first.buyer?.nickname || '' },
+    // Flex: sigue en "Etiquetas impresas" hasta que el cliente lo recibe; el resto sale cuando la agencia/centro lo recibe
+    shipped: logistic === 'self_service' ? ['delivered'].includes(sh.status) : alreadyOut(sh),
+    meta: { status: sh.status, substatus: sh.substatus, buffered_until: sh.status === 'pending' && sh.substatus === 'buffered' ? (sh.shipping_option?.buffering?.date || null) : null, logistic, dispatch_by: dBy, ml_delayed: mlDelayed, out: alreadyOut(sh), customer: sh.receiver_address?.receiver_name || [first.buyer?.first_name, first.buyer?.last_name].filter(Boolean).join(' ') || first.buyer?.nickname || '' },
   };
 }
 
@@ -1241,7 +1242,17 @@ async function sales(conn, fromISO, toISO) {
   });
 }
 
-module.exports = { sales, debugList, test, listShipments, fetchLabel, normalize, orderItems };
+// Vuelve a consultar un pedido puntual (para saber si ya se despachó o entregó)
+async function refresh(conn, order) {
+  const items = await orderItems(conn.creds, order.external_id);
+  const meta = JSON.parse(order.meta || '{}');
+  const n = normalize({ OrderId: order.external_id, OrderNumber: order.order_number, CreatedAt: order.sold_at }, items);
+  if (!n.meta.customer) n.meta.customer = meta.customer || '';
+  if (!n.items.length) n.items = JSON.parse(order.items || '[]');
+  return n;
+}
+async function debugOrder(conn, order) { return { items: await orderItems(conn.creds, order.external_id) }; }
+module.exports = { refresh, debugOrder, sales, debugList, test, listShipments, fetchLabel, normalize, orderItems };
 
 };
 
@@ -1358,7 +1369,14 @@ async function sales(conn, fromISO, toISO) {
   return out;
 }
 
-module.exports = { sales, test, listShipments, fetchLabel };
+// Vuelve a consultar un pedido puntual en Paris (para saber si ya se despachó)
+async function refresh(conn, order) {
+  const meta = JSON.parse(order.meta || '{}');
+  const list = await shipmentsOf(conn, { subOrderNumber: order.order_number, originOrderDate: order.sold_at, items: JSON.parse(order.items || '[]').map(i => ({ name: i.name, sellerSku: i.sku, sku: i.pub_id, quantity: i.qty })), customer: { name: meta.customer || '' } });
+  return list.find(x => String(x.external_id) === String(order.external_id)) || list[0] || null;
+}
+async function debugOrder(conn, order) { return { shipments: await api(conn, `/v2/shipments/${encodeURIComponent(order.order_number)}`) }; }
+module.exports = { refresh, debugOrder, sales, test, listShipments, fetchLabel };
 
 };
 
@@ -1584,6 +1602,8 @@ async function upsert(conn, s) {
   }
   let state = existing.state;
   if (s.cancelled && !['printed', 'shipped'].includes(state)) state = 'cancelled';
+  // Flex que se había dado por enviado al retirarlo el conductor: vuelve a "impresa" hasta que el cliente lo recibe
+  else if (!s.shipped && !s.cancelled && state === 'shipped' && mk === 'ml' && s.meta?.logistic === 'self_service' && existing.printed_at) state = 'printed';
   else if (s.shipped && state !== 'shipped') {
     // Ya salió (en Mercado Libre aparece "Seguir envío"): se da por impresa y enviada
     state = 'shipped';
@@ -2055,6 +2075,7 @@ function isLate(o, meta) {
   if (['shipped', 'cancelled'].includes(o.state)) return false;
   // cancelada en el marketplace (aunque ya estuviera impresa) no es atrasada
   if (meta.status === 'cancelled' || meta.cancelled) return false;
+  if (meta.out) return false; // ya salió (la retiró el conductor Flex o la recibió la agencia)
   const dl = lateDeadline(o.marketplace, meta);
   return Boolean(dl && dl < new Date());
 }
