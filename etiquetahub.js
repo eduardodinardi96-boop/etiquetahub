@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS sales_sync (connection_id INTEGER PRIMARY KEY, backfi
 CREATE TABLE IF NOT EXISTS item_family (marketplace TEXT NOT NULL, pub_id TEXT NOT NULL, family TEXT, fetched_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (marketplace, pub_id));`);
 
 // Migraciones simples (columnas nuevas)
-for (const [t, c, def] of [['users', 'must_change', 'INTEGER NOT NULL DEFAULT 0'], ['sessions', 'impersonator_id', 'INTEGER'], ['users', 'backup_hash', 'TEXT'], ['orders', 'block_no', 'INTEGER'], ['orders', 'unblocked_at', 'TEXT'], ['orders', 'unblocked_by', 'TEXT']]) {
+for (const [t, c, def] of [['users', 'must_change', 'INTEGER NOT NULL DEFAULT 0'], ['sessions', 'impersonator_id', 'INTEGER'], ['users', 'backup_hash', 'TEXT'], ['orders', 'block_no', 'INTEGER'], ['orders', 'unblocked_at', 'TEXT'], ['orders', 'unblocked_by', 'TEXT'], ['item_family', 'family_id', 'TEXT'], ['item_family', 'up_id', 'TEXT']]) {
   const cols = db.prepare(`PRAGMA table_info(${t})`).all().map(x => x.name);
   if (!cols.includes(c)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${def}`);
 }
@@ -928,6 +928,7 @@ async function buildFromShipment(conn, shipmentId, knownOrders = []) {
       sku: oi.item?.seller_sku || oi.item?.seller_custom_field || '', pub_id: oi.item?.id, qty: oi.quantity,
     });
   }
+  await addFamilyIds(conn, items);
   const first = orders[0] || {};
   return {
     external_id: String(sh.id),
@@ -1007,23 +1008,43 @@ async function sales(conn, fromISO, toISO) {
   return out;
 }
 
+// IDs "de publicación" del modelo nuevo de Mercado Libre (User Products): cada color/talla es un MLC… distinto,
+// pero el vendedor ve y bloquea el ID de la familia (p. ej. 7601467027761936) o el del producto (MLCU…).
+const idCache = new Map(); // pub_id -> { fam_id, up_id }
+async function itemIds(conn, ids) {
+  const need = [...new Set(ids.filter(id => id && !idCache.has(id)))];
+  for (let i = 0; i < need.length; i += 20) {
+    const chunk = need.slice(i, i + 20);
+    try {
+      const r = await api(conn, `/items?ids=${chunk.join(',')}&attributes=id,family_id,user_product_id`);
+      for (const x of Array.isArray(r) ? r : []) { const b = x.body || {}; if (b.id) idCache.set(b.id, { fam_id: b.family_id ? String(b.family_id) : '', up_id: b.user_product_id || '' }); }
+    } catch { /* sin dato: se reintenta en la próxima sincronización */ }
+  }
+  const out = {}; for (const id of ids) if (idCache.has(id)) out[id] = idCache.get(id);
+  return out;
+}
+async function addFamilyIds(conn, items) {
+  const m = await itemIds(conn, items.map(i => i.pub_id).filter(Boolean));
+  for (const it of items) { const x = m[it.pub_id]; if (x) { if (x.fam_id) it.fam_id = x.fam_id; if (x.up_id) it.up_id = x.up_id; } }
+}
+
 // "Familia" de cada publicación: con el modelo nuevo de Mercado Libre (User Products) cada variante es una publicación
 // distinta (otro MLC…), pero todas comparten family_name. Sirve para agruparlas como una sola.
 async function families(conn, ids) {
   const out = {};
   for (let i = 0; i < ids.length; i += 20) {
     const chunk = ids.slice(i, i + 20);
-    const r = await api(conn, `/items?ids=${chunk.join(',')}&attributes=id,title,family_name,user_product_id`);
+    const r = await api(conn, `/items?ids=${chunk.join(',')}&attributes=id,title,family_name,family_id,user_product_id`);
     for (const x of Array.isArray(r) ? r : []) {
       const b = x.body || {};
-      if (b.id) out[b.id] = { family: b.family_name || '', up: b.user_product_id || '' };
+      if (b.id) out[b.id] = { family: b.family_name || '', fam_id: b.family_id ? String(b.family_id) : '', up: b.user_product_id || '' };
     }
-    for (const id of chunk) if (!out[id]) out[id] = { family: '', up: '' };
+    for (const id of chunk) if (!out[id]) out[id] = { family: '', fam_id: '', up: '' };
   }
   return out;
 }
 
-module.exports = { families, sales, debugOrder, refresh, authUrl, exchangeCode, whoAmI, listShipments, fetchLabel, fromNotification };
+module.exports = { itemIds, families, sales, debugOrder, refresh, authUrl, exchangeCode, whoAmI, listShipments, fetchLabel, fromNotification };
 
 };
 
@@ -1421,9 +1442,9 @@ function blockedBy(order) {
   const rules = db.prepare('SELECT marketplace, value FROM blocklist WHERE seller_id = ?').all(order.seller_id);
   const hits = [];
   // Normaliza: mayúsculas, sin espacios/guiones, y el ID de Mercado Libre con o sin "MLC" (MLC123 = 123)
-  const norm = v => { const x = String(v).trim().toUpperCase().replace(/[\s-]+/g, ''); return [x, x.replace(/^MLC/, '')]; };
+  const norm = v => { const x = String(v).trim().toUpperCase().replace(/[\s#-]+/g, ''); return [x, x.replace(/^MLC/, '')]; };
   items.forEach((it, index) => {
-    const keys = new Set([it.sku, it.pub_id].filter(Boolean).flatMap(norm));
+    const keys = new Set([it.sku, it.pub_id, it.fam_id, it.up_id].filter(Boolean).flatMap(norm)); // también el ID de familia / producto de Mercado Libre
     const r = rules.find(r => (r.marketplace === 'any' || r.marketplace === order.marketplace) && norm(r.value).some(k => k && keys.has(k)));
     if (r) hits.push({ index, sku: it.sku, pub_id: it.pub_id, name: it.name, rule: r.value });
   });
@@ -1650,11 +1671,11 @@ async function refresh(force = false) {
         // familias de las publicaciones de Mercado Libre (para agrupar variantes que son publicaciones separadas)
         if (row.marketplace === 'ml' && c.families) {
           const ids = db.prepare(`SELECT DISTINCT i.pub_id FROM sale_items i LEFT JOIN item_family f ON f.marketplace='ml' AND f.pub_id=i.pub_id
-            WHERE i.marketplace='ml' AND i.seller_id=? AND i.pub_id<>'' AND f.pub_id IS NULL LIMIT 3000`).all(row.seller_id).map(r => r.pub_id);
+            WHERE i.marketplace='ml' AND i.seller_id=? AND i.pub_id<>'' AND (f.pub_id IS NULL OR f.family_id IS NULL) LIMIT 3000`).all(row.seller_id).map(r => r.pub_id);
           if (ids.length) {
             const fam = await c.families(conn, ids);
-            const ins = db.prepare("INSERT OR REPLACE INTO item_family (marketplace, pub_id, family) VALUES ('ml',?,?)");
-            for (const [id, f] of Object.entries(fam)) ins.run(id, f.family || '');
+            const ins = db.prepare("INSERT OR REPLACE INTO item_family (marketplace, pub_id, family, family_id, up_id) VALUES ('ml',?,?,?,?)");
+            for (const [id, f] of Object.entries(fam)) ins.run(id, f.family || '', f.fam_id || '', f.up || '');
           }
         }
       } catch (e) { console.warn('[ventas]', row.marketplace, row.seller_id, e.message); }
@@ -1693,13 +1714,13 @@ function baseTitle(t) {
 function products(sellerId, from, to, { excludeBlocked = false } = {}) {
   const args = [from, to]; let where = 'day >= ? AND day <= ?';
   if (sellerId) { where += ' AND i.seller_id = ?'; args.push(sellerId); }
-  const rows = db.prepare(`SELECT i.*, s.name seller, f.family FROM sale_items i LEFT JOIN sellers s ON s.id = i.seller_id
+  const rows = db.prepare(`SELECT i.*, s.name seller, f.family, f.family_id, f.up_id FROM sale_items i LEFT JOIN sellers s ON s.id = i.seller_id
     LEFT JOIN item_family f ON f.marketplace = i.marketplace AND f.pub_id = i.pub_id WHERE ${where}`).all(...args);
   // Se agrupa por publicación (en Mercado Libre, el ID MLC… que comparte todas sus variantes); dentro, por variante
   // para el fulfillment: no se cuentan los productos que el vendedor bloqueó (el fulfillment no los trabaja)
   let isBlockedItem = () => false;
   if (excludeBlocked) {
-    const norm = v => { const x = String(v || '').trim().toUpperCase().replace(/[\s-]+/g, ''); return x ? [x, x.replace(/^MLC/, '')] : []; };
+    const norm = v => { const x = String(v || '').trim().toUpperCase().replace(/[\s#-]+/g, ''); return x ? [x, x.replace(/^MLC/, '')] : []; };
     const rules = new Map();
     for (const b of db.prepare('SELECT seller_id, marketplace, value FROM blocklist').all()) {
       if (!rules.has(b.seller_id)) rules.set(b.seller_id, []);
@@ -1707,7 +1728,7 @@ function products(sellerId, from, to, { excludeBlocked = false } = {}) {
     }
     isBlockedItem = r => {
       const list = rules.get(r.seller_id); if (!list) return false;
-      const keys = new Set([...norm(r.sku), ...norm(r.pub_id)]);
+      const keys = new Set([...norm(r.sku), ...norm(r.pub_id), ...norm(r.family_id), ...norm(r.up_id)]);
       return list.some(x => (x.mk === 'any' || x.mk === r.marketplace) && x.keys.some(k => keys.has(k)));
     };
   }
