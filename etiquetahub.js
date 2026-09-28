@@ -2033,12 +2033,11 @@ function chileAt(day, hhmmss) {
 }
 const chileDay = d => new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
 const parseD = v => { if (!v) return null; const d = new Date(String(v).includes('T') ? v : String(v).replace(' ', 'T')); return isNaN(d) ? null : d; };
-// Día de despacho de Paris: se usa el día que informa Paris (el más tardío entre su fecha y la fecha en hora de Chile)
+// Día de despacho de Paris: el día (hora de Chile) del plazo que informa Paris; se puede entregar hasta las 23:59
 function parisDay(v) {
   const d = parseD(v); const raw = String(v).slice(0, 10);
   if (!d) return /^\d{4}-\d{2}-\d{2}$/.test(raw) ? raw : null;
-  const cl = chileDay(d);
-  return /^\d{4}-\d{2}-\d{2}$/.test(raw) && raw > cl ? raw : cl;
+  return chileDay(d);
 }
 // Horario límite real de entrega:
 //  - Paris: hasta las 23:59 del día de despacho
