@@ -180,6 +180,13 @@ for (const [t, c, def] of [['users', 'must_change', 'INTEGER NOT NULL DEFAULT 0'
   if (!cols.includes(c)) db.exec(`ALTER TABLE ${t} ADD COLUMN ${c} ${def}`);
 }
 
+// pedidos que quedaron apuntando a una conexión borrada (se desconectó y se volvió a conectar): se pasan a la conexión actual
+try {
+  db.exec(`UPDATE orders SET connection_id = (SELECT c.id FROM connections c WHERE c.seller_id = orders.seller_id AND c.marketplace = orders.marketplace ORDER BY c.id DESC LIMIT 1)
+    WHERE connection_id NOT IN (SELECT id FROM connections)
+      AND EXISTS (SELECT 1 FROM connections c WHERE c.seller_id = orders.seller_id AND c.marketplace = orders.marketplace)`);
+} catch (e) { console.warn('[db] reasignar conexiones:', e.message); }
+
 module.exports = db;
 
 };
@@ -1491,7 +1498,12 @@ function fetchLabelFile(orderId) {
     const order = getOrder(orderId);
     if (!order) throw new Error('Pedido no encontrado');
     if (order.label_file && fs.existsSync(labelPath(order.id))) return labelPath(order.id);
-    const row = db.prepare('SELECT * FROM connections WHERE id=?').get(order.connection_id);
+    let row = db.prepare('SELECT * FROM connections WHERE id=?').get(order.connection_id);
+    if (!row) {
+      // la cuenta se desconectó y se volvió a conectar (queda con otro id): se usa la conexión actual del vendedor
+      row = db.prepare('SELECT * FROM connections WHERE seller_id=? AND marketplace=? ORDER BY id DESC').get(order.seller_id, order.marketplace);
+      if (row) db.prepare('UPDATE orders SET connection_id=? WHERE id=?').run(row.id, order.id);
+    }
     if (!row) throw new Error('La cuenta del marketplace ya no está conectada');
     let conn = connObj(row);
     let original;
@@ -1558,6 +1570,8 @@ async function upsert(conn, s) {
   }
   db.prepare(`UPDATE orders SET items=?, meta=?, state=?, updated_at=datetime('now') WHERE id=?`)
     .run(JSON.stringify(s.items), JSON.stringify(s.meta || {}), state, existing.id);
+  // si la cuenta se reconectó (nuevo id de conexión) el pedido pasa a la conexión vigente del mismo vendedor
+  if (existing.connection_id !== conn.row.id && existing.seller_id === conn.row.seller_id) db.prepare('UPDATE orders SET connection_id=? WHERE id=?').run(conn.row.id, existing.id);
   if (state !== existing.state) bus.emit('change', { type: 'order', orderId: existing.id, sellerId: conn.row.seller_id });
   return existing.id;
 }
