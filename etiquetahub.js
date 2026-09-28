@@ -1573,6 +1573,13 @@ async function upsert(conn, s) {
     .run(JSON.stringify(s.items), JSON.stringify(s.meta || {}), state, existing.id);
   // si la cuenta se reconectó (nuevo id de conexión) el pedido pasa a la conexión vigente del mismo vendedor
   if (existing.connection_id !== conn.row.id && existing.seller_id === conn.row.seller_id) db.prepare('UPDATE orders SET connection_id=? WHERE id=?').run(conn.row.id, existing.id);
+  // La venta aparece en la cuenta de ESTE vendedor pero estaba registrada a otro (p. ej. entró mientras una cuenta
+  // estaba mal conectada): el dueño real es quien la vendió, se corrige el vendedor del pedido.
+  if (existing.seller_id !== conn.row.seller_id && mk === 'ml') {
+    db.prepare('UPDATE orders SET seller_id=?, connection_id=? WHERE id=?').run(conn.row.seller_id, conn.row.id, existing.id);
+    logEvent(conn.row.seller_id, 'order', `Pedido ${existing.order_number} corregido: la venta es de esta cuenta de Mercado Libre`);
+    bus.emit('change', { type: 'order', orderId: existing.id, sellerId: conn.row.seller_id });
+  }
   if (state !== existing.state) bus.emit('change', { type: 'order', orderId: existing.id, sellerId: conn.row.seller_id });
   return existing.id;
 }
