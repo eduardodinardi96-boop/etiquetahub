@@ -925,7 +925,7 @@ async function buildFromShipment(conn, shipmentId, knownOrders = []) {
   for (const o of orders) for (const oi of o.order_items || []) {
     items.push({
       name: oi.item?.title, variant: variantText(oi.item || {}),
-      sku: oi.item?.seller_sku || oi.item?.seller_custom_field || '', pub_id: oi.item?.id, qty: oi.quantity,
+      sku: oi.item?.seller_sku || oi.item?.seller_custom_field || '', pub_id: oi.item?.id, qty: oi.quantity, up_id: oi.item?.user_product_id || undefined,
     });
   }
   await addFamilyIds(conn, items);
@@ -1011,7 +1011,9 @@ async function sales(conn, fromISO, toISO) {
 // IDs "de publicación" del modelo nuevo de Mercado Libre (User Products): cada color/talla es un MLC… distinto,
 // pero el vendedor ve y bloquea el ID de la familia (p. ej. 7601467027761936) o el del producto (MLCU…).
 const idCache = new Map(); // pub_id -> { fam_id, up_id }
+let itemsForbiddenAt = 0; // la app de Mercado Libre no tiene permiso para leer publicaciones: no insistir por 6 horas
 async function itemIds(conn, ids) {
+  if (Date.now() - itemsForbiddenAt < 6 * 3600e3) return {};
   const need = [...new Set(ids.filter(id => id && !idCache.has(id)))];
   for (let i = 0; i < need.length; i += 20) {
     const chunk = need.slice(i, i + 20);
@@ -1019,9 +1021,8 @@ async function itemIds(conn, ids) {
     try {
       const r = await api(conn, `/items?ids=${chunk.join(',')}&attributes=id,family_id,user_product_id`);
       for (const x of Array.isArray(r) ? r : []) put(x.body);
-    } catch {
-      // la consulta múltiple puede venir rechazada: se consulta una por una
-      for (const id of chunk) { try { put(await api(conn, `/items/${id}`)); } catch { /* sin dato */ } }
+    } catch (e) {
+      if (/403/.test(e.message)) { itemsForbiddenAt = Date.now(); console.warn('[ML] sin permiso para leer publicaciones (/items): no se puede leer el ID de familia'); return {}; }
     }
   }
   const out = {}; for (const id of ids) if (idCache.has(id)) out[id] = idCache.get(id);
@@ -1029,7 +1030,7 @@ async function itemIds(conn, ids) {
 }
 async function addFamilyIds(conn, items) {
   const m = await itemIds(conn, items.map(i => i.pub_id).filter(Boolean));
-  for (const it of items) { const x = m[it.pub_id]; if (x) { if (x.fam_id) it.fam_id = x.fam_id; if (x.up_id) it.up_id = x.up_id; } }
+  for (const it of items) { const x = m[it.pub_id]; if (x) { if (x.fam_id) it.fam_id = x.fam_id; if (x.up_id && !it.up_id) it.up_id = x.up_id; } }
 }
 
 // "Familia" de cada publicación: con el modelo nuevo de Mercado Libre (User Products) cada variante es una publicación
@@ -1762,7 +1763,7 @@ function products(sellerId, from, to, { excludeBlocked = false } = {}) {
   }
   const fin = x => ({ ...x, orders: x.orders.size, amount: Math.round(x.amount) });
   const byQty = (a, b) => b.qty - a.qty || b.amount - a.amount;
-  const list = [...pubs.values()].map(p => ({ ...fin(p), pubIds: undefined, pub_id: p.pubIds.size > 1 ? `${p.pubIds.size} publicaciones` : p.pub_id, variants: [...p.variants.values()].map(fin).sort(byQty) })).sort(byQty);
+  const list = [...pubs.values()].map(p => ({ ...fin(p), pubIds: undefined, pubList: [...p.pubIds], pub_id: p.pubIds.size > 1 ? `${p.pubIds.size} publicaciones` : p.pub_id, variants: [...p.variants.values()].map(fin).sort(byQty) })).sort(byQty);
   // desde qué día hay historial completo
   const conns = db.prepare(`SELECT c.id FROM connections c WHERE c.marketplace IN ('ml','fa','pa') ${sellerId ? 'AND c.seller_id = ?' : ''}`).all(...(sellerId ? [sellerId] : []));
   let since = today();
