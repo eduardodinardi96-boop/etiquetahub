@@ -1011,9 +1011,9 @@ async function sales(conn, fromISO, toISO) {
 // IDs "de publicación" del modelo nuevo de Mercado Libre (User Products): cada color/talla es un MLC… distinto,
 // pero el vendedor ve y bloquea el ID de la familia (p. ej. 7601467027761936) o el del producto (MLCU…).
 const idCache = new Map(); // pub_id -> { fam_id, up_id }
-let itemsForbiddenAt = 0; // la app de Mercado Libre no tiene permiso para leer publicaciones: no insistir por 6 horas
+let itemsForbiddenAt = 0; // la app de Mercado Libre no tiene permiso para leer publicaciones: no insistir por 20 minutos
 async function itemIds(conn, ids) {
-  if (Date.now() - itemsForbiddenAt < 6 * 3600e3) return {};
+  if (Date.now() - itemsForbiddenAt < 20 * 60e3) return {};
   const need = [...new Set(ids.filter(id => id && !idCache.has(id)))];
   for (let i = 0; i < need.length; i += 20) {
     const chunk = need.slice(i, i + 20);
@@ -2434,7 +2434,9 @@ async function route(req, res) {
       const c = db.prepare("SELECT * FROM connections WHERE id=? AND marketplace='ml'").get(Number(dbr[1]));
       const path = url.searchParams.get('path') || '';
       if (!c || !path.startsWith('/')) return fail(res, 404, 'Sin datos');
-      try { return ok(res, { data: await sync.connectors.ml.raw(sync.connObj(c), path) }); } catch (e) { return fail(res, 500, e.message); }
+      const co = sync.connObj(c);
+      if (url.searchParams.get('fresh') === '1') co.creds.expires_at = 0; // fuerza un token nuevo (toma los permisos actuales de la app)
+      try { return ok(res, { data: await sync.connectors.ml.raw(co, path) }); } catch (e) { return fail(res, 500, e.message); }
     }
     const dbg = p.match(/^\/api\/admin\/debug\/order\/(\d+)$/);
     if (dbg && m === 'GET') {
