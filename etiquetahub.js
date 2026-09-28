@@ -1493,8 +1493,27 @@ function fetchLabelFile(orderId) {
     if (order.label_file && fs.existsSync(labelPath(order.id))) return labelPath(order.id);
     const row = db.prepare('SELECT * FROM connections WHERE id=?').get(order.connection_id);
     if (!row) throw new Error('La cuenta del marketplace ya no está conectada');
-    const conn = connObj(row);
-    const original = await connectors[row.marketplace].fetchLabel(conn, order);
+    let conn = connObj(row);
+    let original;
+    try { original = await connectors[row.marketplace].fetchLabel(conn, order); }
+    catch (e) {
+      // El envío pertenece a otra cuenta (p. ej. el pedido entró mientras una cuenta estaba mal conectada):
+      // se busca la cuenta dueña del envío y se corrige el vendedor del pedido.
+      if (row.marketplace !== 'ml' || !/invalid_caller|HTTP 40[13]/.test(e.message)) throw e;
+      let fixed = false;
+      for (const other of db.prepare("SELECT * FROM connections WHERE marketplace='ml' AND id<>?").all(row.id)) {
+        try {
+          const c2 = connObj(other);
+          original = await connectors.ml.fetchLabel(c2, order);
+          db.prepare('UPDATE orders SET seller_id=?, connection_id=? WHERE id=?').run(other.seller_id, other.id, order.id);
+          order.seller_id = other.seller_id; conn = c2; fixed = true;
+          logEvent(other.seller_id, 'order', `Pedido ${order.order_number} corregido: pertenece a esta cuenta de Mercado Libre`);
+          bus.emit('change', { type: 'order', orderId: order.id, sellerId: other.seller_id });
+          break;
+        } catch { /* no es de esta cuenta */ }
+      }
+      if (!fixed) throw e;
+    }
     const seller = db.prepare('SELECT name FROM sellers WHERE id = ?').get(order.seller_id);
     const missing = new Set(blockedBy(order).map(h => h.index));
     const stamped = await stampLabel(original, {
@@ -2144,6 +2163,9 @@ async function route(req, res) {
     if (!code || sig !== sec.sign(`ml:${sellerId}:${ts}`) || Date.now() - Number(ts) > 15 * 60e3) return send(res, 400, 'Autorización inválida o vencida. Vuelve a intentarlo desde EtiquetaHub.');
     try {
       const t = await ml.exchangeCode(code);
+      // Evita conectar por error la cuenta de Mercado Libre de OTRO vendedor (pasa si el navegador tenía otra sesión abierta)
+      const dup = db.prepare("SELECT c.seller_id, s.name, c.account_label FROM connections c JOIN sellers s ON s.id=c.seller_id WHERE c.marketplace='ml' AND c.external_id=? AND c.seller_id<>?").get(String(t.user_id), Number(sellerId));
+      if (dup) return send(res, 409, `Esa cuenta de Mercado Libre${dup.account_label ? ' (' + dup.account_label + ')' : ''} ya está conectada al vendedor ${dup.name}. Cierra sesión en Mercado Libre, entra con la cuenta correcta de este vendedor y vuelve a conectar desde EtiquetaHub.`);
       const connId = upsertConnection(Number(sellerId), 'ml', t, { externalId: t.user_id });
       const conn = sync.connObj(db.prepare('SELECT * FROM connections WHERE id=?').get(connId));
       const me = await ml.whoAmI(conn).catch(() => null);
