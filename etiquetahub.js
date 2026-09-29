@@ -2275,7 +2275,7 @@ async function summary(user, sellerId, force) {
   const accounts = res.filter(x => x.r.marketplace === 'ml' && x.d).map(x => x.d).sort((a, b) => a.seller.localeCompare(b.seller));
   const faAcc = res.filter(x => x.r.marketplace === 'fa' && x.d).map(x => x.d).sort((a, b) => a.seller.localeCompare(b.seller));
   const ats = rows.map(r => accCache.get(r.id)?.at).filter(Boolean);
-  let late = []; try { late = await lateOrders(only); } catch (e) { console.warn('[mkp] atrasados', e.message); }
+  const late = await lateCached(only);
   return { at: new Date(ats.length ? Math.min(...ats) : Date.now()).toISOString(), today: chileDay(new Date()), loading: res.some(x => x.d && x.d.loading), accounts, falabella: faAcc, paris: { supported: false }, late };
 }
 // ---------- Pedidos atrasados (Mercado Libre) ----------
@@ -2346,6 +2346,14 @@ async function lateOrders(only) {
     out.push({ ...k, mk: o.marketplace, id: o.id, seller_id: o.seller_id, seller: o.seller, order_number: o.order_number, shipment: o.external_id, dispatch_by: o.meta.dispatch_by, status: o.meta.status, substatus: o.meta.substatus || '', customer: o.meta.customer || '', printed: Boolean(o.printed_at), products: items.map(i => ({ title: [i.name, i.variant].filter(Boolean).join(' · '), qty: i.qty || 1 })) });
   }
   return out.sort((a, b) => (a.level === b.level ? 0 : a.level === 'late' ? -1 : 1) || String(a.dispatch_by).localeCompare(String(b.dispatch_by)));
+}
+// atrasados: se entrega al instante lo último calculado y se recalcula en segundo plano (máx. cada 60 s)
+const lateCache = new Map(); // clave vendedor|all -> { at, data, p }
+function lateCached(only) {
+  const k = String(only || 'all'); const c = lateCache.get(k) || {};
+  const run = () => { if (!c.p) c.p = lateOrders(only).then(d => { c.data = d; c.at = Date.now(); }).catch(e => console.warn('[mkp] atrasados', e.message)).finally(() => { c.p = null; }); lateCache.set(k, c); return c.p; };
+  if (c.data) { if (Date.now() - c.at > 60e3) run(); return Promise.resolve(c.data); }
+  return Promise.race([run().then(() => c.data || []), new Promise(r => setTimeout(() => r(c.data || []), 3000))]);
 }
 // se precalcula cada 3 minutos para que la sección abra al instante
 setTimeout(function warm() {
