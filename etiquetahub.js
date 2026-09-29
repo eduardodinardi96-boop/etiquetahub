@@ -203,7 +203,7 @@ try {
 // pedidos que quedaron apuntando a una conexión borrada (se desconectó y se volvió a conectar): se pasan a la conexión actual
 try {
   db.exec(`UPDATE orders SET connection_id = (SELECT c.id FROM connections c WHERE c.seller_id = orders.seller_id AND c.marketplace = orders.marketplace ORDER BY c.id DESC LIMIT 1)
-    WHERE connection_id NOT IN (SELECT id FROM connections)
+    WHERE (connection_id IS NULL OR connection_id NOT IN (SELECT id FROM connections))
       AND EXISTS (SELECT 1 FROM connections c WHERE c.seller_id = orders.seller_id AND c.marketplace = orders.marketplace)`);
 } catch (e) { console.warn('[db] reasignar conexiones:', e.message); }
 
@@ -1602,7 +1602,8 @@ async function upsert(conn, s) {
     return id;
   }
   let state = existing.state;
-  if (s.cancelled && !['printed', 'shipped'].includes(state)) state = 'cancelled';
+  // cancelada en el marketplace (aunque ya estuviera impresa): no se despacha, no cuenta como atrasada ni en camino
+  if (s.cancelled && state !== 'shipped') state = 'cancelled';
   // Flex que se había dado por enviado al retirarlo el conductor: vuelve a "impresa" hasta que el cliente lo recibe
   else if (!s.shipped && !s.cancelled && state === 'shipped' && mk === 'ml' && s.meta?.logistic === 'self_service' && existing.printed_at) state = 'printed';
   else if (s.shipped && state !== 'shipped') {
@@ -1673,6 +1674,12 @@ async function syncConnection(connId, only = null) {
 }
 
 async function syncAll() {
+  // pedidos que quedaron sin conexión (se desconectó y reconectó la cuenta): pasan a la conexión actual del vendedor
+  try {
+    db.exec(`UPDATE orders SET connection_id = (SELECT c.id FROM connections c WHERE c.seller_id = orders.seller_id AND c.marketplace = orders.marketplace ORDER BY c.id DESC LIMIT 1)
+      WHERE (connection_id IS NULL OR connection_id NOT IN (SELECT id FROM connections)) AND state NOT IN ('shipped','cancelled')
+        AND EXISTS (SELECT 1 FROM connections c WHERE c.seller_id = orders.seller_id AND c.marketplace = orders.marketplace)`);
+  } catch (e) { console.warn('[sync] reasignar conexiones:', e.message); }
   const rows = db.prepare('SELECT id FROM connections').all();
   for (const r of rows) await syncConnection(r.id);
 }
