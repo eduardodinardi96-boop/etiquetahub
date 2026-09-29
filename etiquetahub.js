@@ -1350,7 +1350,8 @@ async function shipmentsOf(conn, sub) {
     sold_at: sub.originOrderDate || sub.createdAt,
     items: itemsOf(sh.items?.length ? sh.items : sub.items),
     labelReady: Boolean(sh.labelId || sh.labelUrl),
-    cancelled: false,
+    // cancelada en Paris: el envío queda en estado 18 o todos sus productos tienen motivo de cancelación
+    cancelled: Number(sh.statusId) === 18 || (() => { const its = (sh.items?.length ? sh.items : sub.items) || []; return its.length > 0 && its.every(i => i.cancellationReasonId || i.cancellationReason); })(),
     shipped: Boolean(sh.effectiveDispatchDate),
     meta: { dispatch_by: sh.dispatchDateTime || (sh.dispatchDate ? sh.dispatchDate + ' 23:59:00' : null), labelId: sh.labelId || null, labelUrl: sh.labelUrl || null, carrier: sh.carrier, tracking: sh.trackingNumber || null, statusId: sh.statusId, shipmentId: sh.id, customer: sub.customer?.name || [sh.shippingAddress?.firstName, sh.shippingAddress?.lastName].filter(Boolean).join(' ') },
   }));
@@ -1709,8 +1710,8 @@ async function syncConnection(connId, only = null) {
     // Pedidos abiertos en la app que ya no vienen en la lista (p. ej. se enviaron): se consultan uno por uno
     if (!only && connectors[row.marketplace].refresh) {
       const seen = new Set(list.filter(Boolean).map(s => String(s.external_id)));
-      const open = db.prepare("SELECT * FROM orders WHERE connection_id=? AND state IN ('waiting','ready','error')").all(connId).filter(o => !seen.has(String(o.external_id)));
-      for (const o of open.slice(0, 50)) {
+      const open = db.prepare("SELECT * FROM orders WHERE connection_id=? AND state IN ('waiting','ready','error') ORDER BY updated_at ASC").all(connId).filter(o => !seen.has(String(o.external_id)));
+      for (const o of open.slice(0, 150)) { // las menos actualizadas primero, así ninguna queda sin revisar (p. ej. canceladas)
         try { const s = await connectors[row.marketplace].refresh(conn, o); if (s) list.push(s); } catch (e) { console.warn('[sync] refrescar', o.order_number, e.message); }
       }
       // Impresas que aún no figuran como enviadas: se revisan por turnos (las menos actualizadas primero) para saber
@@ -2081,6 +2082,7 @@ async function orderInfo(conn, orderId) {
       buyer: [b.first_name, b.last_name].filter(Boolean).join(' ') || b.nickname || '', buyer_id: b.id,
       products: (o.order_items || []).map(i => ({ title: i.item?.title, qty: i.quantity, price: Number(i.unit_price || 0) * Number(i.quantity || 1) })),
       total: Number(o.total_amount || 0),
+      status: o.status || '', tags: o.tags || [], mediations: (o.mediations || []).length,
     };
   } catch { return { order_id: String(orderId), buyer: '', products: [], total: 0 }; }
 }
@@ -2138,8 +2140,14 @@ async function mlAccount(row) {
       const raw = th.v?.messages || [];
       const msgs = raw.map(x => ({ from: String(x.from?.user_id) === String(uid) ? 'seller' : 'buyer', text: x.text, date: x.message_date?.created || x.date_created })).sort((a, b) => String(a.date).localeCompare(String(b.date)));
       const buyerId = info.buyer_id || raw.map(x => String(x.from?.user_id) === String(uid) ? x.to?.user_id : x.from?.user_id).find(Boolean);
-      return { pack_id: pack, buyer_id: buyerId, unread: r.count || 1, buyer: info.buyer || await userName(conn, buyerId), product: info.products.map(p => p.title).join(' · '), thread: msgs };
-    });
+      // Conversación cerrada: devolución, reclamo/mediación o venta cancelada → no se muestra (ya no hay nada que responder)
+      const cs = th.v?.conversation_status || {};
+      const closed = String(cs.status || '').toLowerCase() === 'blocked' || /blocked|disabled/i.test(String(cs.substatus || ''))
+        || (!th.ok && /40[13]/.test(String(th.err || ''))) || info.status === 'cancelled' || info.mediations > 0
+        || (info.tags || []).some(t => /return|refund|claim|mediation/i.test(t));
+      if (closed) return null;
+      return { pack_id: pack, order_id: info.order_id, buyer_id: buyerId, unread: r.count || 1, buyer: info.buyer || await userName(conn, buyerId), product: info.products.map(p => p.title).join(' · '), thread: msgs };
+    }).then(a => a.filter(Boolean));
   }
 
   // Reclamos y mediaciones abiertas
@@ -2183,6 +2191,9 @@ async function mlAccount(row) {
     });
     acc.returns = rows.filter(Boolean);
   }
+  // Si la venta ya tiene reclamo o devolución, su conversación de mensajes queda deshabilitada en Mercado Libre: se oculta
+  const closedOrders = new Set([...acc.claims, ...acc.returns].flatMap(x => [x.order_id, x.pack_id]).filter(Boolean).map(String));
+  acc.messages = acc.messages.filter(m => !closedOrders.has(String(m.pack_id)) && !closedOrders.has(String(m.order_id || '')));
   return acc;
 }
 
