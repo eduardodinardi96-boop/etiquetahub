@@ -2075,7 +2075,21 @@ async function items(conn, ids) {
 }
 async function orderInfo(conn, orderId) {
   try {
-    const o = await ml.raw(conn, `/orders/${orderId}`);
+    let o;
+    try { o = await ml.raw(conn, `/orders/${orderId}`); }
+    catch (e) {
+      // es un número de carrito (pack): se busca la primera venta del carrito
+      const pk = await ml.raw(conn, `/packs/${orderId}`);
+      const first = (pk.orders || [])[0]?.id;
+      if (!first) throw e;
+      o = await ml.raw(conn, `/orders/${first}`);
+      if (!o.pack_id) o.pack_id = orderId;
+      // el carrito trae varias ventas: se juntan todos los productos
+      for (const x of (pk.orders || []).slice(1, 8)) {
+        try { const o2 = await ml.raw(conn, `/orders/${x.id}`); o.order_items = [...(o.order_items || []), ...(o2.order_items || [])]; o.total_amount = Number(o.total_amount || 0) + Number(o2.total_amount || 0); } catch {}
+      }
+      if (!o.shipping?.id && pk.shipment?.id) o.shipping = { id: pk.shipment.id };
+    }
     const b = o.buyer || {};
     return {
       order_id: String(o.id), pack_id: o.pack_id ? String(o.pack_id) : null,
