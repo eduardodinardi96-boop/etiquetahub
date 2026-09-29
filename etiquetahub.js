@@ -1183,7 +1183,7 @@ function normalize(order, items) {
     labelReady: statuses.length > 0 && statuses.every(s => s === 'ready_to_ship'),
     cancelled: active.length === 0,
     shipped: statuses.length > 0 && statuses.every(s => ['shipped', 'delivered'].includes(s)),
-    meta: { dispatch_by: active.map(i => i.PromisedShippingTime).filter(Boolean).sort()[0] || null, orderItemIds: active.map(i => String(i.OrderItemId)), statuses, packageId: active.find(i => i.PackageId)?.PackageId || null, tracking: active.find(i => i.TrackingCode)?.TrackingCode || null, carrier: active.find(i => i.ShipmentProvider)?.ShipmentProvider || null, customer: [order.CustomerFirstName, order.CustomerLastName].filter(Boolean).join(' ') || [order.AddressShipping?.FirstName, order.AddressShipping?.LastName].filter(Boolean).join(' ') },
+    meta: { mk_printed: statuses.length > 0 && statuses.every(x => x === 'ready_to_ship'), dispatch_by: active.map(i => i.PromisedShippingTime).filter(Boolean).sort()[0] || null, orderItemIds: active.map(i => String(i.OrderItemId)), statuses, packageId: active.find(i => i.PackageId)?.PackageId || null, tracking: active.find(i => i.TrackingCode)?.TrackingCode || null, carrier: active.find(i => i.ShipmentProvider)?.ShipmentProvider || null, customer: [order.CustomerFirstName, order.CustomerLastName].filter(Boolean).join(' ') || [order.AddressShipping?.FirstName, order.AddressShipping?.LastName].filter(Boolean).join(' ') },
   };
 }
 
@@ -1421,7 +1421,20 @@ async function refresh(conn, order) {
   const list = await shipmentsOf(conn, { subOrderNumber: order.order_number, originOrderDate: order.sold_at, items: JSON.parse(order.items || '[]').map(i => ({ name: i.name, sellerSku: i.sku, sku: i.pub_id, quantity: i.qty })), customer: { name: meta.customer || '' } });
   return list.find(x => String(x.external_id) === String(order.external_id)) || list[0] || null;
 }
-async function debugOrder(conn, order) { return { shipments: await api(conn, `/v2/shipments/${encodeURIComponent(order.order_number)}`) }; }
+async function debugOrder(conn, order) {
+  const out = { shipments: await api(conn, `/v2/shipments/${encodeURIComponent(order.order_number)}`) };
+  // sub-orden completa (para ver los estados que entrega Paris)
+  try {
+    const from = new Date(new Date(order.sold_at || order.created_at || Date.now()).getTime() - 864e5).toISOString();
+    for (let offset = 0; offset < 1000 && !out.subOrder; offset += 50) {
+      const r = await api(conn, `/v3/sub-orders?gteCreatedAt=${encodeURIComponent(from)}&limit=50&offset=${offset}`);
+      const subs = flatten(r?.data);
+      out.subOrder = subs.find(x => String(x.subOrderNumber) === String(order.order_number)) || null;
+      if (subs.length < 50) break;
+    }
+  } catch (e) { out.subOrderError = e.message; }
+  return out;
+}
 module.exports = { refresh, debugOrder, sales, test, listShipments, fetchLabel };
 
 };
@@ -1632,18 +1645,22 @@ function fetchLabelFile(orderId) {
   return p;
 }
 
+const MKNAME = { fa: 'Falabella', pa: 'Paris', ml: 'Mercado Libre' };
 async function upsert(conn, s) {
   const mk = s.mk || conn.row.marketplace;
   const existing = db.prepare('SELECT * FROM orders WHERE marketplace = ? AND external_id = ?').get(mk, s.external_id);
   // Ya NO se marca como impresa solo porque Mercado Libre diga "printed": otras herramientas (o el propio ML)
   // descargan la etiqueta sin que nadie la imprima. Solo se muestra un aviso en la tarjeta.
-  const printedOutside = false;
+  // Paris y Falabella: si la etiqueta ya se imprimió directamente en el marketplace, pasa a "Etiquetas impresas".
+  // (En Mercado Libre no, porque otras herramientas descargan la etiqueta sin imprimirla.)
+  // En Falabella "listo para despacho" = etiqueta impresa, salvo que la cuenta dependa de marcarlo a mano para que la app la reciba.
+  const printedOutside = Boolean(s.meta?.mk_printed) && (mk === 'pa' || (mk === 'fa' && Boolean(conn.settings?.autoReady)));
   if (!existing) {
     if (s.shipped || s.cancelled) return;
     const r = db.prepare(`INSERT INTO orders (seller_id, connection_id, marketplace, external_id, order_number, sold_at, items, meta)
       VALUES (?,?,?,?,?,?,?,?)`).run(conn.row.seller_id, conn.row.id, mk, s.external_id, s.order_number, s.sold_at || null, JSON.stringify(s.items), JSON.stringify(s.meta || {}));
     const id = Number(r.lastInsertRowid);
-    if (printedOutside) db.prepare(`UPDATE orders SET state='printed', printed_at=datetime('now'), printed_by='Mercado Libre' WHERE id=?`).run(id);
+    if (printedOutside) db.prepare(`UPDATE orders SET state='printed', printed_at=datetime('now'), printed_by=? WHERE id=?`).run(MKNAME[mk] ? `Impresa en ${MKNAME[mk]}` : 'Marketplace', id);
     logEvent(conn.row.seller_id, 'order', `Nuevo pedido ${s.order_number}`);
     bus.emit('change', { type: 'order', orderId: id, sellerId: conn.row.seller_id });
     return id;
@@ -1662,7 +1679,8 @@ async function upsert(conn, s) {
   // Mercado Libre dice que la etiqueta ya se imprimió: pasa a impresa (salvo que alguien la haya marcado "no impresa" a mano)
   if (printedOutside && ['ready', 'waiting', 'error'].includes(state) && !existing.unprinted_at) {
     state = 'printed';
-    db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by=? WHERE id=?`).run(existing.label_at ? 'EtiquetaHub' : 'Mercado Libre', existing.id);
+    db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by=? WHERE id=?`).run(`Impresa en ${MKNAME[mk] || 'el marketplace'}`, existing.id);
+    logEvent(existing.seller_id, 'print', `Pedido ${existing.order_number}: impreso directamente en ${MKNAME[mk] || 'el marketplace'}`);
   }
   db.prepare(`UPDATE orders SET items=?, meta=?, state=?, updated_at=datetime('now') WHERE id=?`)
     .run(JSON.stringify(s.items), JSON.stringify(s.meta || {}), state, existing.id);
