@@ -2909,7 +2909,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS returns_log (mk TEXT NOT NULL, rid TEXT NOT 
   units INTEGER NOT NULL DEFAULT 1, amount REAL NOT NULL DEFAULT 0, status TEXT, title TEXT, final INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (mk, rid));
 CREATE INDEX IF NOT EXISTS returns_log_day ON returns_log (seller_id, day);
-CREATE TABLE IF NOT EXISTS returns_sync (seller_id INTEGER PRIMARY KEY, at INTEGER);`);
+CREATE TABLE IF NOT EXISTS returns_sync_v2 (seller_id INTEGER PRIMARY KEY, at INTEGER);`);
 
 const DAYS = 120;
 const num = v => { const n = Number(String(v ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
@@ -2966,9 +2966,11 @@ async function syncFa(conn, sellerId) {
   const after = new Date(Date.now() - DAYS * 864e5).toISOString().replace(/\.\d{3}Z$/, '+00:00');
   const orders = [];
   for (let off = 0; off < 3000; off += 100) {
-    const b = await fa.call(conn.creds, 'GetOrders', { UpdatedAfter: after, Status: 'returned', Limit: '100', Offset: String(off) });
+    // el filtro Status=returned de Falabella no devuelve nada: se recorren las órdenes y se toman las devueltas
+    const b = await fa.call(conn.creds, 'GetOrders', { CreatedAfter: after, Limit: '100', Offset: String(off), SortBy: 'created_at', SortDirection: 'DESC' });
     const page = fa.list(b.Orders, 'Order');
-    orders.push(...page);
+    const st = o => JSON.stringify(o.Statuses || o.Status || '');
+    orders.push(...page.filter(o => /return/i.test(st(o))));
     if (page.length < 100) break;
   }
   await pool(orders, 5, async o => {
@@ -3001,7 +3003,7 @@ async function syncPa(conn, sellerId) {
 const running = new Map();
 function refresh(sellerId, maxAgeMs = 30 * 60e3) {
   if (running.has(sellerId)) return running.get(sellerId);
-  const last = db.prepare('SELECT at FROM returns_sync WHERE seller_id=?').get(sellerId)?.at || 0;
+  const last = db.prepare('SELECT at FROM returns_sync_v2 WHERE seller_id=?').get(sellerId)?.at || 0;
   if (Date.now() - last < maxAgeMs) return null;
   const p = (async () => {
     const sync = require('./sync');
@@ -3014,7 +3016,7 @@ function refresh(sellerId, maxAgeMs = 30 * 60e3) {
         if (c.marketplace === 'pa') await syncPa(conn, sellerId);
       } catch (e) { console.warn('[devoluciones]', c.marketplace, e.message); }
     }
-    db.prepare('INSERT INTO returns_sync (seller_id, at) VALUES (?,?) ON CONFLICT(seller_id) DO UPDATE SET at=excluded.at').run(sellerId, Date.now());
+    db.prepare('INSERT INTO returns_sync_v2 (seller_id, at) VALUES (?,?) ON CONFLICT(seller_id) DO UPDATE SET at=excluded.at').run(sellerId, Date.now());
   })().finally(() => running.delete(sellerId));
   running.set(sellerId, p);
   return p;
@@ -3026,7 +3028,7 @@ function summary(sellerId, from, to) {
   const by = { ml: { n: 0, units: 0, amount: 0 }, fa: { n: 0, units: 0, amount: 0 }, pa: { n: 0, units: 0, amount: 0 } };
   for (const r of rows) if (by[r.mk]) by[r.mk] = { n: r.n, units: r.u || 0, amount: Math.round(r.a || 0) };
   const tot = Object.values(by).reduce((a, x) => ({ n: a.n + x.n, units: a.units + x.units, amount: a.amount + x.amount }), { n: 0, units: 0, amount: 0 });
-  const last = db.prepare('SELECT at FROM returns_sync WHERE seller_id=?').get(sellerId)?.at || null;
+  const last = db.prepare('SELECT at FROM returns_sync_v2 WHERE seller_id=?').get(sellerId)?.at || null;
   return { by, total: { ...tot, net: Math.round(tot.amount / 1.19) }, synced_at: last, syncing: running.has(sellerId) };
 }
 
