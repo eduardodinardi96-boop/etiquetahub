@@ -2569,7 +2569,7 @@ async function mlListings(conn, errors) {
     for (const x of r || []) if (x?.code === 200 && x.body) items.push(x.body);
   }
   // Mercado Ads: gasto y TACOS por publicación (últimos 30 días)
-  const ads = await mlAds(conn).catch(e => { errors.push('Mercado Ads: ' + String(e.message || e).slice(0, 160)); return null; });
+  const ads = await mlAds(conn).catch(e => { const msg = /UNAUTHORIZED|403/.test(String(e.message)) ? 'El TACOS no se puede traer automático: la app de Mercado Libre no tiene el permiso de Publicidad. Mientras tanto escríbelo a mano en cada producto.' : 'Mercado Ads: ' + String(e.message || e).slice(0, 160); if (!errors.includes(msg)) errors.push(msg); return null; });
   const rows = await pool(items, 6, async it => {
     const price = num(it.price);
     const fk = `${it.category_id}|${it.listing_type_id}|${price}`;
@@ -2655,17 +2655,10 @@ async function faListings(conn, sellerId, errors) {
       if (ps.length < 100) break;
     }
   } catch (e) { errors.push('Falabella productos: ' + String(e.message).slice(0, 140)); }
-  // comisión efectiva según los estados de pago (comisión cobrada / ventas)
-  try {
-    const b = await fa.call(conn.creds, 'GetPayoutStatus', { FilterDate: new Date(Date.now() - 90 * 864e5).toISOString().replace(/\.\d{3}Z$/, '+00:00') });
-    let com = 0, rev = 0;
-    const walk = o => { if (!o || typeof o !== 'object') return; for (const [k, v] of Object.entries(o)) { if (v && typeof v === 'object') walk(v); else if (/commission/i.test(k) && !/refund/i.test(k)) com += Math.abs(num(v)); else if (/^(item_?revenue|itemrevenue|sales|total_?sales)$/i.test(k)) rev += Math.abs(num(v)); } };
-    walk(b);
-    if (com > 0 && rev > 0) feePct = Math.round(com / rev * 1000) / 10;
-  } catch (e) { errors.push('Falabella comisión: ' + String(e.message).slice(0, 140)); }
+  // Falabella no entrega la comisión por API (GetPayoutStatus no está habilitado): se usa un % editable
   const sold = soldProducts(sellerId, 'fa');
   const seen = new Set(), rows = [];
-  const push = (key, sku, title, price, img, units) => rows.push({ mk: 'fa', key, id: sku, sku, title, thumb: img || '', price, fee: null, fee_pct: feePct ?? DEFAULT_FEE.fa, fee_src: feePct != null ? 'Falabella (promedio cobrado)' : 'estimado', ship: 0, ship_src: 'editable', tacos: null, tacos_src: 'editable', units90: units || 0 });
+  const push = (key, sku, title, price, img, units) => rows.push({ mk: 'fa', key, id: sku, sku, title, thumb: img || '', price, fee: null, fee_pct: feePct ?? DEFAULT_FEE.fa, fee_src: 'estimado', ship: 0, ship_src: 'editable', tacos: null, tacos_src: 'editable', units90: units || 0 });
   for (const s of sold) { const p = prices.get(String(s.sku).toUpperCase()); seen.add(String(s.sku).toUpperCase()); push(s.key, s.sku, p?.name || s.title, p ? p.price : Math.round(s.avg), p?.img, s.units90); }
   for (const [sku, p] of prices) if (!seen.has(sku)) push(sku, sku, p.name, p.price, p.img, 0);
   return rows;
@@ -2674,21 +2667,28 @@ async function faListings(conn, sellerId, errors) {
 async function paListings(conn, sellerId, errors) {
   const pa = require('./connectors/paris');
   const fees = new Map(); // sku -> % de comisión si la API la entrega en los ítems de la orden
+  const imgs = new Map();
   try {
     const from = new Date(Date.now() - 60 * 864e5).toISOString();
-    const r = await pa.raw(conn, `/v3/sub-orders?gteCreatedAt=${encodeURIComponent(from)}&limit=50&offset=0`);
-    for (const sub of pa.flatten(r?.data)) for (const it of sub.items || []) {
+    for (let off = 0; off < 400; off += 50) {
+    const r = await pa.raw(conn, `/v3/sub-orders?gteCreatedAt=${encodeURIComponent(from)}&limit=50&offset=${off}`);
+    const subs = pa.flatten(r?.data);
+    for (const sub of subs) for (const it of sub.items || []) {
+      const sk = String(it.sellerSku || it.sku || '').toUpperCase();
+      if (it.imagePath && !imgs.has(sk)) imgs.set(sk, String(it.imagePath));
       const k = Object.keys(it).find(x => /commission/i.test(x) && /percent|rate|pct/i.test(x));
       const kAmt = Object.keys(it).find(x => /commission/i.test(x) && !/percent|rate|pct/i.test(x));
       const price = num(it.priceAfterDiscounts ?? it.grossPrice ?? it.price);
       let pct = k ? num(it[k]) : (kAmt && price ? num(it[kAmt]) / price * 100 : null);
       if (pct != null && pct > 0 && pct < 1) pct *= 100;
-      if (pct) fees.set(String(it.sellerSku || it.sku || '').toUpperCase(), Math.round(pct * 10) / 10);
+      if (pct) fees.set(sk, Math.round(pct * 10) / 10);
+    }
+    if (subs.length < 50) break;
     }
   } catch (e) { errors.push('Paris comisión: ' + String(e.message).slice(0, 140)); }
   return soldProducts(sellerId, 'pa').map(s => {
     const f = fees.get(String(s.sku).toUpperCase());
-    return { mk: 'pa', key: s.key, id: s.id, sku: s.sku, title: s.title, thumb: '', price: Math.round(s.avg), fee: null, fee_pct: f ?? DEFAULT_FEE.pa, fee_src: f != null ? 'Paris' : 'estimado (tabla Paris vestuario)', ship: 0, ship_src: 'editable', tacos: null, tacos_src: 'editable', units90: s.units90 };
+    return { mk: 'pa', key: s.key, id: s.id, sku: s.sku, title: s.title, thumb: imgs.get(String(s.sku).toUpperCase()) || '', price: Math.round(s.avg), fee: null, fee_pct: f ?? DEFAULT_FEE.pa, fee_src: f != null ? 'Paris' : 'estimado (tabla Paris vestuario)', ship: 0, ship_src: 'editable', tacos: null, tacos_src: 'editable', units90: s.units90 };
   });
 }
 
