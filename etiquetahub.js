@@ -2535,6 +2535,217 @@ module.exports = { summary, answerQuestion, sendMessage, claimMessages, claimRep
 
 };
 
+__defs["profit"] = function (module, exports, require, __dirname) {
+// Calculador de ganancia real por publicación (Análisis ventas)
+// Mercado Libre: comisión (listing_prices), envío que paga el vendedor (shipping_options/free) y TACOS de Mercado Ads.
+// Falabella / Paris: precio vigente y comisión estimada desde la API (si la entrega) o un valor por defecto editable.
+// El vendedor ingresa el costo del producto con IVA; la ganancia se calcula neta (sin IVA) en el navegador.
+const db = require('./db');
+
+db.exec(`CREATE TABLE IF NOT EXISTS item_cost (seller_id INTEGER NOT NULL, marketplace TEXT NOT NULL, key TEXT NOT NULL,
+  cost REAL, fee_pct REAL, ship REAL, tacos REAL, updated_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (seller_id, marketplace, key));
+CREATE TABLE IF NOT EXISTS profit_cache (seller_id INTEGER PRIMARY KEY, data TEXT, at INTEGER);`);
+
+const DEFAULT_FEE = { fa: 18, pa: 18 }; // % por defecto si la API no entrega la comisión (vestuario en Paris = 18%)
+const num = v => { const n = Number(String(v ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function pool(list, n, fn) { const out = []; let i = 0; await Promise.all(Array.from({ length: Math.min(n, list.length) }, async () => { while (i < list.length) { const k = i++; try { out[k] = await fn(list[k]); } catch (e) { out[k] = null; } } })); return out; }
+const dayStr = d => d.toISOString().slice(0, 10);
+
+// ---------- Mercado Libre ----------
+const feeCache = new Map(); // `${cat}|${lt}|${price}` -> fee
+async function mlListings(conn, errors) {
+  const ml = require('./connectors/ml');
+  const uid = conn.creds.user_id;
+  const ids = [];
+  for (let off = 0; off < 1000; off += 100) {
+    const r = await ml.raw(conn, `/users/${uid}/items/search?status=active&limit=100&offset=${off}`);
+    ids.push(...(r?.results || []));
+    if ((r?.results || []).length < 100) break;
+  }
+  const items = [];
+  for (let i = 0; i < ids.length; i += 20) {
+    const r = await ml.raw(conn, `/items?ids=${ids.slice(i, i + 20).join(',')}&attributes=id,title,price,listing_type_id,category_id,thumbnail,secure_thumbnail,shipping,attributes,seller_custom_field,permalink,sold_quantity`);
+    for (const x of r || []) if (x?.code === 200 && x.body) items.push(x.body);
+  }
+  // Mercado Ads: gasto y TACOS por publicación (últimos 30 días)
+  const ads = await mlAds(conn).catch(e => { errors.push('Mercado Ads: ' + String(e.message || e).slice(0, 160)); return null; });
+  const rows = await pool(items, 6, async it => {
+    const price = num(it.price);
+    const fk = `${it.category_id}|${it.listing_type_id}|${price}`;
+    let fee = feeCache.get(fk);
+    if (fee === undefined) {
+      try {
+        const r = await ml.raw(conn, `/sites/MLC/listing_prices?price=${price}&listing_type_id=${it.listing_type_id}&category_id=${it.category_id}`);
+        const o = Array.isArray(r) ? r[0] : r;
+        fee = num(o?.sale_fee_amount); feeCache.set(fk, fee);
+      } catch { fee = null; }
+    }
+    const logistic = it.shipping?.logistic_type || '';
+    let ship = 0, shipSrc = 'sin costo';
+    if (it.shipping?.free_shipping) {
+      try {
+        const r = await ml.raw(conn, `/users/${uid}/shipping_options/free?item_id=${it.id}`);
+        ship = num(r?.coverage?.all_country?.list_cost); shipSrc = 'Mercado Libre';
+      } catch { ship = null; shipSrc = 'no disponible'; }
+    } else shipSrc = 'lo paga el comprador';
+    const a = ads?.get(it.id);
+    const sku = (it.attributes || []).find(x => x.id === 'SELLER_SKU')?.value_name || it.seller_custom_field || '';
+    return {
+      mk: 'ml', key: it.id, id: it.id, title: it.title, thumb: (it.secure_thumbnail || it.thumbnail || '').replace(/^http:/, 'https:'), sku, url: it.permalink || '',
+      price, fee, fee_src: fee == null ? 'no disponible' : 'Mercado Libre', ship, ship_src: shipSrc,
+      logistic: ({ self_service: 'Flex', cross_docking: 'Colecta', drop_off: 'Agencia', xd_drop_off: 'Agencia', fulfillment: 'Full' })[logistic] || '',
+      listing: it.listing_type_id === 'gold_pro' ? 'Premium' : it.listing_type_id === 'gold_special' ? 'Clásica' : it.listing_type_id,
+      tacos: a ? a.tacos : null, ads_cost: a ? a.cost : null, tacos_src: a ? 'Mercado Ads' : (ads ? 'sin publicidad' : 'no disponible'),
+      sold: num(it.sold_quantity),
+    };
+  });
+  return rows.filter(Boolean);
+}
+
+async function mlAds(conn) {
+  const ml = require('./connectors/ml');
+  const adv = await ml.apiH(conn, '/advertising/advertisers?product_id=PADS', { 'Api-Version': '1' });
+  const list = adv?.advertisers || [];
+  const a = list.find(x => x.site_id === 'MLC') || list[0];
+  if (!a) return new Map();
+  const to = new Date(), from = new Date(Date.now() - 29 * 864e5);
+  const out = new Map();
+  const metrics = 'cost,tacos,acos,total_amount,units_quantity,direct_amount,indirect_amount,organic_units_amount';
+  for (let off = 0; off < 2000; off += 100) {
+    const r = await ml.apiH(conn, `/advertising/MLC/advertisers/${a.advertiser_id}/product_ads/ads/search?limit=100&offset=${off}&date_from=${dayStr(from)}&date_to=${dayStr(to)}&metrics=${metrics}`, { 'api-version': '2' });
+    const res = r?.results || [];
+    for (const x of res) {
+      const m = x.metrics || x.metrics_summary || {};
+      const cost = num(m.cost);
+      // TACOS = gasto en publicidad / ventas totales del producto (en %). Si no viene, se calcula.
+      let tacos = m.tacos != null ? num(m.tacos) : null;
+      const total = num(m.total_amount) + num(m.organic_units_amount);
+      if (tacos == null && total > 0) tacos = cost / total * 100;
+      out.set(String(x.item_id || x.id), { cost, tacos: tacos == null ? (cost > 0 ? null : 0) : tacos });
+    }
+    if (res.length < 100) break;
+    await sleep(200);
+  }
+  return out;
+}
+
+// ---------- Falabella / Paris: productos vendidos (últimos 90 días) con su precio promedio ----------
+function soldProducts(sellerId, mk) {
+  const since = dayStr(new Date(Date.now() - 90 * 864e5));
+  const rows = db.prepare(`SELECT sku, pub_id, name, SUM(qty) q, SUM(amount) a, MAX(day) last FROM sale_items WHERE seller_id=? AND marketplace=? AND day>=? GROUP BY COALESCE(NULLIF(sku,''), pub_id, name) ORDER BY q DESC`).all(sellerId, mk, since);
+  return rows.map(r => ({ key: r.sku || r.pub_id || r.name, sku: r.sku || '', id: r.pub_id || '', title: r.name, avg: r.q ? r.a / r.q : 0, units90: r.q }));
+}
+
+async function faListings(conn, sellerId, errors) {
+  const fa = require('./connectors/falabella');
+  const prices = new Map();
+  let feePct = null;
+  // precio vigente (con descuento si está activo) desde el catálogo
+  try {
+    for (let off = 0; off < 3000; off += 100) {
+      const b = await fa.call(conn.creds, 'GetProducts', { Filter: 'live', Limit: '100', Offset: String(off) });
+      const ps = fa.list(b.Products, 'Product');
+      for (const p of ps) {
+        const base = num(p.Price), sale = num(p.SalePrice);
+        const now = Date.now(), s = Date.parse(p.SaleStartDate || '') || 0, e = Date.parse(p.SaleEndDate || '') || Infinity;
+        const price = sale > 0 && now >= s && now <= e ? sale : base;
+        prices.set(String(p.SellerSku || '').toUpperCase(), { price, base, name: p.Name, img: p.MainImage || (p.Images && (p.Images.Image || [])[0]) || '' });
+      }
+      if (ps.length < 100) break;
+    }
+  } catch (e) { errors.push('Falabella productos: ' + String(e.message).slice(0, 140)); }
+  // comisión efectiva según los estados de pago (comisión cobrada / ventas)
+  try {
+    const b = await fa.call(conn.creds, 'GetPayoutStatus', { FilterDate: new Date(Date.now() - 90 * 864e5).toISOString().replace(/\.\d{3}Z$/, '+00:00') });
+    let com = 0, rev = 0;
+    const walk = o => { if (!o || typeof o !== 'object') return; for (const [k, v] of Object.entries(o)) { if (v && typeof v === 'object') walk(v); else if (/commission/i.test(k) && !/refund/i.test(k)) com += Math.abs(num(v)); else if (/^(item_?revenue|itemrevenue|sales|total_?sales)$/i.test(k)) rev += Math.abs(num(v)); } };
+    walk(b);
+    if (com > 0 && rev > 0) feePct = Math.round(com / rev * 1000) / 10;
+  } catch (e) { errors.push('Falabella comisión: ' + String(e.message).slice(0, 140)); }
+  const sold = soldProducts(sellerId, 'fa');
+  const seen = new Set(), rows = [];
+  const push = (key, sku, title, price, img, units) => rows.push({ mk: 'fa', key, id: sku, sku, title, thumb: img || '', price, fee: null, fee_pct: feePct ?? DEFAULT_FEE.fa, fee_src: feePct != null ? 'Falabella (promedio cobrado)' : 'estimado', ship: 0, ship_src: 'editable', tacos: null, tacos_src: 'editable', units90: units || 0 });
+  for (const s of sold) { const p = prices.get(String(s.sku).toUpperCase()); seen.add(String(s.sku).toUpperCase()); push(s.key, s.sku, p?.name || s.title, p ? p.price : Math.round(s.avg), p?.img, s.units90); }
+  for (const [sku, p] of prices) if (!seen.has(sku)) push(sku, sku, p.name, p.price, p.img, 0);
+  return rows;
+}
+
+async function paListings(conn, sellerId, errors) {
+  const pa = require('./connectors/paris');
+  const fees = new Map(); // sku -> % de comisión si la API la entrega en los ítems de la orden
+  try {
+    const from = new Date(Date.now() - 60 * 864e5).toISOString();
+    const r = await pa.raw(conn, `/v3/sub-orders?gteCreatedAt=${encodeURIComponent(from)}&limit=50&offset=0`);
+    for (const sub of pa.flatten(r?.data)) for (const it of sub.items || []) {
+      const k = Object.keys(it).find(x => /commission/i.test(x) && /percent|rate|pct/i.test(x));
+      const kAmt = Object.keys(it).find(x => /commission/i.test(x) && !/percent|rate|pct/i.test(x));
+      const price = num(it.priceAfterDiscounts ?? it.grossPrice ?? it.price);
+      let pct = k ? num(it[k]) : (kAmt && price ? num(it[kAmt]) / price * 100 : null);
+      if (pct != null && pct > 0 && pct < 1) pct *= 100;
+      if (pct) fees.set(String(it.sellerSku || it.sku || '').toUpperCase(), Math.round(pct * 10) / 10);
+    }
+  } catch (e) { errors.push('Paris comisión: ' + String(e.message).slice(0, 140)); }
+  return soldProducts(sellerId, 'pa').map(s => {
+    const f = fees.get(String(s.sku).toUpperCase());
+    return { mk: 'pa', key: s.key, id: s.id, sku: s.sku, title: s.title, thumb: '', price: Math.round(s.avg), fee: null, fee_pct: f ?? DEFAULT_FEE.pa, fee_src: f != null ? 'Paris' : 'estimado (tabla Paris vestuario)', ship: 0, ship_src: 'editable', tacos: null, tacos_src: 'editable', units90: s.units90 };
+  });
+}
+
+// ---------- armado por vendedor (en segundo plano, con caché) ----------
+const building = new Map();
+function cached(sellerId) {
+  const r = db.prepare('SELECT data, at FROM profit_cache WHERE seller_id=?').get(sellerId);
+  if (!r) return null;
+  try { return { ...JSON.parse(r.data), at: r.at }; } catch { return null; }
+}
+async function build(sellerId) {
+  const sync = require('./sync');
+  const conns = db.prepare("SELECT * FROM connections WHERE seller_id=? AND marketplace IN ('ml','fa','pa')").all(sellerId);
+  const errors = [], rows = [];
+  for (const c of conns) {
+    const conn = sync.connObj(c);
+    try {
+      if (c.marketplace === 'ml') rows.push(...await mlListings(conn, errors));
+      if (c.marketplace === 'fa') rows.push(...await faListings(conn, sellerId, errors));
+      if (c.marketplace === 'pa') rows.push(...await paListings(conn, sellerId, errors));
+    } catch (e) { errors.push(`${c.marketplace.toUpperCase()}: ${String(e.message).slice(0, 160)}`); }
+  }
+  const data = { rows, errors };
+  db.prepare('INSERT INTO profit_cache (seller_id, data, at) VALUES (?,?,?) ON CONFLICT(seller_id) DO UPDATE SET data=excluded.data, at=excluded.at').run(sellerId, JSON.stringify(data), Date.now());
+  return data;
+}
+function refresh(sellerId, force) {
+  const c = cached(sellerId);
+  const stale = !c || Date.now() - c.at > 6 * 3600e3;
+  if ((force || stale) && !building.has(sellerId)) {
+    const p = build(sellerId).catch(e => console.warn('[ganancia]', e.message)).finally(() => building.delete(sellerId));
+    building.set(sellerId, p);
+  }
+  return building.get(sellerId) || null;
+}
+async function get(sellerId, { force = false, wait = 2500 } = {}) {
+  const p = refresh(sellerId, force);
+  if (p) await Promise.race([p, sleep(wait)]);
+  const c = cached(sellerId);
+  const saved = {};
+  for (const r of db.prepare('SELECT marketplace, key, cost, fee_pct, ship, tacos FROM item_cost WHERE seller_id=?').all(sellerId)) saved[r.marketplace + '|' + r.key] = { cost: r.cost, fee_pct: r.fee_pct, ship: r.ship, tacos: r.tacos };
+  return { loading: building.has(sellerId), at: c?.at || null, rows: c?.rows || [], errors: c?.errors || [], saved };
+}
+function save(sellerId, b) {
+  const mk = String(b.marketplace || ''), key = String(b.key || '').slice(0, 200);
+  if (!['ml', 'fa', 'pa'].includes(mk) || !key) throw new Error('Datos incompletos');
+  const v = x => (x === '' || x == null || !isFinite(Number(x)) ? null : Number(x));
+  db.prepare(`INSERT INTO item_cost (seller_id, marketplace, key, cost, fee_pct, ship, tacos, updated_at) VALUES (?,?,?,?,?,?,?,datetime('now'))
+    ON CONFLICT(seller_id, marketplace, key) DO UPDATE SET cost=excluded.cost, fee_pct=excluded.fee_pct, ship=excluded.ship, tacos=excluded.tacos, updated_at=excluded.updated_at`)
+    .run(sellerId, mk, key, v(b.cost), v(b.fee_pct), v(b.ship), v(b.tacos));
+  return true;
+}
+
+module.exports = { get, save };
+
+};
+
 __defs["server"] = function (module, exports, require, __dirname) {
 const http = require('http');
 const fs = require('fs');
