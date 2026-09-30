@@ -2546,7 +2546,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS item_cost (seller_id INTEGER NOT NULL, marke
   cost REAL, fee_pct REAL, ship REAL, tacos REAL, updated_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (seller_id, marketplace, key));
 CREATE TABLE IF NOT EXISTS profit_cache (seller_id INTEGER PRIMARY KEY, data TEXT, at INTEGER);`);
 
-const CACHE_V = 6; // sube cuando cambia el cálculo, para rehacer la caché
+const CACHE_V = 7; // sube cuando cambia el cálculo, para rehacer la caché
 const DEFAULT_FEE = { fa: 18, pa: 18 }; // % por defecto si la API no entrega la comisión (vestuario en Paris = 18%)
 const num = v => { const n = Number(String(v ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -2600,14 +2600,14 @@ async function mlListings(conn, errors) {
     }
     const a = ads?.get(it.id);
     const s30 = soldMap.get(String(it.id)) || 0;
-    const adTacos = a ? (a.tacos != null ? a.tacos : (s30 > 0 ? a.cost / s30 * 100 : (a.cost > 0 ? null : 0))) : null;
+    const adTacos = a ? (a.tacos != null ? a.tacos : (s30 > 0 ? a.cost / s30 * 100 : null)) : null;
     const sku = (it.attributes || []).find(x => x.id === 'SELLER_SKU')?.value_name || it.seller_custom_field || '';
     return {
       mk: 'ml', key: it.id, id: it.id, title: it.title, thumb: (it.secure_thumbnail || it.thumbnail || '').replace(/^http:/, 'https:'), sku, url: it.permalink || '',
       price, regular, fee, fee_src: fee == null ? 'no disponible' : 'Mercado Libre', ship, ship_src: shipSrc,
       logistic: ({ self_service: 'Flex', cross_docking: 'Colecta', drop_off: 'Agencia', xd_drop_off: 'Agencia', fulfillment: 'Full' })[logistic] || '',
       listing: it.listing_type_id === 'gold_pro' ? 'Premium' : it.listing_type_id === 'gold_special' ? 'Clásica' : it.listing_type_id, listing_type: it.listing_type_id,
-      tacos: adTacos, ads_cost: a ? a.cost : null, sales30: s30, tacos_src: a ? 'Mercado Ads' : (ads ? 'sin publicidad' : 'no disponible'),
+      tacos: adTacos, ads_cost: a ? a.cost : null, ads_amount: a ? a.amount : null, sales30: s30, tacos_src: a ? 'Mercado Ads' : (ads ? 'sin publicidad' : 'no disponible'),
       sold: num(it.sold_quantity), family: it.family_name || '',
     };
   });
@@ -2641,11 +2641,10 @@ async function mlAds(conn) {
       const m = x.metrics || x.metrics_summary || {};
       const id = String(x.item_id || x.item?.id || x.id || '');
       if (!id) continue;
-      const prev = out.get(id) || { cost: 0, tacos: null };
-      const cost = prev.cost + num(m.cost);
-      // TACOS que informa Mercado Ads (neto, en %); si no viene se calcula con las ventas del producto
-      const tacos = m.tacos != null && m.tacos !== '' ? num(m.tacos) : prev.tacos;
-      out.set(id, { cost, tacos });
+      // TACOS de Mercado Ads = gasto / ventas totales del producto (con publicidad + orgánicas)
+      const prev = out.get(id) || { cost: 0, amount: 0 };
+      const cost = prev.cost + num(m.cost), amount = prev.amount + num(m.total_amount) + num(m.organic_units_amount);
+      out.set(id, { cost, amount, tacos: amount > 0 ? cost / amount * 100 : (m.tacos != null ? num(m.tacos) : (cost > 0 ? null : 0)) });
     }
     if (res.length < 100) break;
     await sleep(200);
@@ -2744,8 +2743,7 @@ function groupByPublication(rows) {
     x.sold += r.sold || 0; x.units90 += r.units90 || 0;
     x.prices.set(r.price, (x.prices.get(r.price) || 0) + 1 + (r.sold || r.units90 || 0));
     if (!x.thumb && r.thumb) x.thumb = r.thumb;
-    if (r.ads_cost != null) { x._adc = (x._adc || 0) + r.ads_cost; x._ads = true; x.tacos_src = r.tacos_src; }
-    x._s30 = (x._s30 || 0) + (r.sales30 || 0);
+    if (r.ads_cost != null) { x._adc = (x._adc || 0) + r.ads_cost; x._ada = (x._ada || 0) + (r.ads_amount || 0); x._ads = true; x.tacos_src = r.tacos_src; }
     if (x.tacos == null && r.tacos != null) { x.tacos = r.tacos; x.tacos_src = r.tacos_src; }
   }
   return [...g.values()].map(x => {
@@ -2754,8 +2752,8 @@ function groupByPublication(rows) {
     const ref = rows.find(r => r.mk === x.mk && r.price === price && x.ids.includes(r.id)) || x;
     const out = { ...x, price, regular: ref.regular ?? null, base: ref.base ?? null, fee: ref.fee, ship: ref.ship, ship_src: ref.ship_src, id: x.ids[0] || '', sku: [...new Set(x.skus)].length === 1 ? x.skus[0] : (x.skus.length ? x.skus.length + ' SKU' : ''), url: ref.url || x.url };
     // TACOS de la publicación = gasto total en publicidad / ventas totales de todas sus variantes
-    if (x._ads && x._s30 > 0) out.tacos = Math.round(x._adc / x._s30 * 1000) / 10;
-    delete out.prices; delete out.skus; delete out.family; delete out._adc; delete out._ads; delete out._s30;
+    if (x._ads && x._ada > 0) out.tacos = Math.round(x._adc / x._ada * 1000) / 10;
+    delete out.prices; delete out.skus; delete out.family; delete out._adc; delete out._ads; delete out._ada;
     if (x.mk === 'ml') out.title = x.family && x.variants > 1 ? x.title : x.title;
     return out;
   });
