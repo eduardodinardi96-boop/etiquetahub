@@ -2987,21 +2987,29 @@ async function syncMl(conn, sellerId) {
 async function syncFa(conn, sellerId) {
   const fa = require('./connectors/falabella');
   const after = new Date(Date.now() - DAYS * 864e5).toISOString().replace(/\.\d{3}Z$/, '+00:00');
-  const orders = [];
-  for (let off = 0; off < 3000; off += 100) {
-    // el filtro Status=returned de Falabella no devuelve nada: se recorren las órdenes y se toman las devueltas
-    const b = await fa.call(conn.creds, 'GetOrders', { CreatedAfter: after, Limit: '100', Offset: String(off), SortBy: 'created_at', SortDirection: 'DESC' });
-    const page = fa.list(b.Orders, 'Order');
-    const st = o => JSON.stringify(o.Statuses || o.Status || '');
-    orders.push(...page.filter(o => /return/i.test(st(o))));
-    if (page.length < 100) break;
+  const byId = new Map();
+  const st = o => JSON.stringify(o.Statuses || o.Status || '');
+  // 1) órdenes en estado "returned"; 2) además se recorren las órdenes recientes y se toman las que tienen algo devuelto
+  for (const extra of [{ Status: 'returned' }, {}]) {
+    for (let off = 0; off < 3000; off += 100) {
+      let page = [];
+      try {
+        const b = await fa.call(conn.creds, 'GetOrders', { ...(extra.Status ? {} : { CreatedAfter: after }), ...extra, Limit: '100', Offset: String(off), SortBy: 'created_at', SortDirection: 'DESC' });
+        page = fa.list(b.Orders, 'Order');
+      } catch (e) { console.warn('[devoluciones] Falabella', e.message); break; }
+      for (const o of page) if (o && o.OrderId && /return/i.test(st(o)) && new Date(String(o.CreatedAt || '').replace(' ', 'T') + '-03:00') >= Date.now() - DAYS * 864e5) byId.set(String(o.OrderId), o);
+      if (page.length < 100) break;
+    }
   }
+  const orders = [...byId.values()];
+  syncFa.last = { seen: orders.length };
   await pool(orders, 5, async o => {
     const k = known.get('fa', String(o.OrderId));
     if (k && k.final && k.keys) return;
-    const its = await fa.orderItems(conn.creds, o.OrderId).catch(() => []);
+    const its = await fa.orderItems(conn.creds, o.OrderId).catch(e => { syncFa.last.err = e.message; return []; });
     const back = its.filter(i => /return/i.test(String(i.Status)));
-    if (!back.length) return;
+    if (!back.length) { syncFa.last.noItems = (syncFa.last.noItems || 0) + 1; return; }
+    syncFa.last.saved = (syncFa.last.saved || 0) + 1;
     const amount = back.reduce((a, i) => a + num(i.PaidPrice || i.ItemPrice), 0);
     upsert('fa', String(o.OrderId), sellerId, dayOf(o.UpdatedAt || o.CreatedAt) || chileDay(new Date()), back.length, amount, 'returned', back[0].Name || '', 1, back.flatMap(i => [i.Sku, i.ShopSku, i.Name]));
   });
@@ -3067,7 +3075,7 @@ function items(sellerId, from, to) {
     .map(r => ({ mk: r.mk, units: r.units || 0, amount: r.amount || 0, keys: (() => { try { return JSON.parse(r.keys || '[]'); } catch { return []; } })() }));
 }
 
-module.exports = { get, refresh, summary, items };
+module.exports = { get, refresh, summary, items, syncFa };
 
 };
 
@@ -3993,6 +4001,15 @@ async function route(req, res) {
         if (dbx[1] === 'fa') { const action = url.searchParams.get('action') || ''; if (!/^Get[A-Za-z]+$/.test(action)) return fail(res, 400, 'Solo acciones Get'); return ok(res, { data: await sync.connectors.fa.call(co.creds, action, JSON.parse(url.searchParams.get('params') || '{}')) }); }
         if (dbx[1] === 'pa') { const path = url.searchParams.get('path') || ''; if (!path.startsWith('/')) return fail(res, 400, 'Ruta'); return ok(res, { data: await sync.connectors.pa.raw(co, path) }); }
       } catch (e) { return fail(res, 500, e.message); }
+    }
+    // diagnóstico: vuelve a leer las devoluciones de Falabella de una conexión y dice cuántas encontró
+    const dbf = p.match(/^\/api\/admin\/debug\/fareturns\/(\d+)$/);
+    if (dbf && m === 'GET') {
+      const c = db.prepare("SELECT * FROM connections WHERE id=? AND marketplace='fa'").get(Number(dbf[1]));
+      if (!c) return fail(res, 404, 'Sin datos');
+      const R = require('./returns');
+      try { await R.syncFa(sync.connObj(c), c.seller_id); return ok(res, { seller_id: c.seller_id, ...R.syncFa.last, rows: db.prepare("SELECT COUNT(*) n FROM returns_log WHERE mk='fa' AND seller_id=?").get(c.seller_id).n }); }
+      catch (e) { return fail(res, 500, e.stack || e.message); }
     }
     const dbg = p.match(/^\/api\/admin\/debug\/order\/(\d+)$/);
     if (dbg && m === 'GET') {
