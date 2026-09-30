@@ -2546,7 +2546,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS item_cost (seller_id INTEGER NOT NULL, marke
   cost REAL, fee_pct REAL, ship REAL, tacos REAL, updated_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (seller_id, marketplace, key));
 CREATE TABLE IF NOT EXISTS profit_cache (seller_id INTEGER PRIMARY KEY, data TEXT, at INTEGER);`);
 
-const CACHE_V = 7; // sube cuando cambia el cálculo, para rehacer la caché
+const CACHE_V = 8; // sube cuando cambia el cálculo, para rehacer la caché
 const DEFAULT_FEE = { fa: 18, pa: 18 }; // % por defecto si la API no entrega la comisión (vestuario en Paris = 18%)
 const num = v => { const n = Number(String(v ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -2579,6 +2579,16 @@ async function mlListings(conn, errors) {
       const sp = await ml.raw(conn, `/items/${it.id}/sale_price?context=channel_marketplace`);
       if (num(sp?.amount) > 0) { price = num(sp.amount); regular = sp.regular_amount ? num(sp.regular_amount) : null; }
     } catch { /* sin promoción o sin dato */ }
+    // promociones activas del vendedor (campañas, SMART, DEAL, descuentos): se usa el precio más bajo vigente.
+    // sale_price a veces no refleja algunas (p. ej. SMART), por eso se revisa también aquí.
+    try {
+      const pr = await ml.raw(conn, `/seller-promotions/items/${it.id}?app_version=v2`);
+      const started = (Array.isArray(pr) ? pr : []).filter(x => x.status === 'started' && num(x.price) > 0);
+      if (started.length) {
+        const best = Math.min(...started.map(x => num(x.price)));
+        if (best < price) { regular = regular || num(started[0].original_price) || price; price = best; }
+      }
+    } catch { /* la cuenta aún sin permiso de promociones: queda el precio de sale_price */ }
     const fk = `${it.category_id}|${it.listing_type_id}|${price}`;
     let fee = feeCache.get(fk);
     if (fee === undefined) {
