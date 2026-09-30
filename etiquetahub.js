@@ -2546,7 +2546,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS item_cost (seller_id INTEGER NOT NULL, marke
   cost REAL, fee_pct REAL, ship REAL, tacos REAL, updated_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (seller_id, marketplace, key));
 CREATE TABLE IF NOT EXISTS profit_cache (seller_id INTEGER PRIMARY KEY, data TEXT, at INTEGER);`);
 
-const CACHE_V = 5; // sube cuando cambia el cálculo, para rehacer la caché
+const CACHE_V = 6; // sube cuando cambia el cálculo, para rehacer la caché
 const DEFAULT_FEE = { fa: 18, pa: 18 }; // % por defecto si la API no entrega la comisión (vestuario en Paris = 18%)
 const num = v => { const n = Number(String(v ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -2570,7 +2570,8 @@ async function mlListings(conn, errors) {
     for (const x of r || []) if (x?.code === 200 && x.body) items.push(x.body);
   }
   // Mercado Ads: gasto y TACOS por publicación (últimos 30 días)
-  const ads = await mlAds(conn).catch(e => { const msg = /UNAUTHORIZED|403/.test(String(e.message)) ? 'El TACOS no se puede traer automático: la app de Mercado Libre no tiene el permiso de Publicidad. Mientras tanto escríbelo a mano en cada producto.' : 'Mercado Ads: ' + String(e.message || e).slice(0, 160); if (!errors.includes(msg)) errors.push(msg); return null; });
+  const soldMap = sales30(conn.row?.seller_id);
+  const ads = await mlAds(conn).catch(e => { if (/UNAUTHORIZED|403/.test(String(e.message))) errors.adsAuth = true; const msg = /UNAUTHORIZED|403/.test(String(e.message)) ? 'El TACOS automático aún no llega para esta cuenta: Mercado Libre activa el permiso de Publicidad cuando renueva el acceso (lo hace solo cada pocas horas; la app reintenta cada 45 minutos). Mientras tanto puedes escribirlo a mano.' : 'Mercado Ads: ' + String(e.message || e).slice(0, 160); if (!errors.includes(msg)) errors.push(msg); return null; });
   const rows = await pool(items, 6, async it => {
     // precio vigente: el de la promoción activa en este momento (sale_price), si no el de la publicación
     let price = num(it.price), regular = null;
@@ -2598,13 +2599,15 @@ async function mlListings(conn, errors) {
       } catch { ship = null; shipSrc = 'no disponible'; }
     }
     const a = ads?.get(it.id);
+    const s30 = soldMap.get(String(it.id)) || 0;
+    const adTacos = a ? (a.tacos != null ? a.tacos : (s30 > 0 ? a.cost / s30 * 100 : (a.cost > 0 ? null : 0))) : null;
     const sku = (it.attributes || []).find(x => x.id === 'SELLER_SKU')?.value_name || it.seller_custom_field || '';
     return {
       mk: 'ml', key: it.id, id: it.id, title: it.title, thumb: (it.secure_thumbnail || it.thumbnail || '').replace(/^http:/, 'https:'), sku, url: it.permalink || '',
       price, regular, fee, fee_src: fee == null ? 'no disponible' : 'Mercado Libre', ship, ship_src: shipSrc,
       logistic: ({ self_service: 'Flex', cross_docking: 'Colecta', drop_off: 'Agencia', xd_drop_off: 'Agencia', fulfillment: 'Full' })[logistic] || '',
       listing: it.listing_type_id === 'gold_pro' ? 'Premium' : it.listing_type_id === 'gold_special' ? 'Clásica' : it.listing_type_id, listing_type: it.listing_type_id,
-      tacos: a ? a.tacos : null, ads_cost: a ? a.cost : null, tacos_src: a ? 'Mercado Ads' : (ads ? 'sin publicidad' : 'no disponible'),
+      tacos: adTacos, ads_cost: a ? a.cost : null, sales30: s30, tacos_src: a ? 'Mercado Ads' : (ads ? 'sin publicidad' : 'no disponible'),
       sold: num(it.sold_quantity), family: it.family_name || '',
     };
   });
@@ -2620,22 +2623,42 @@ async function mlAds(conn) {
   const to = new Date(), from = new Date(Date.now() - 29 * 864e5);
   const out = new Map();
   const metrics = 'cost,tacos,acos,total_amount,units_quantity,direct_amount,indirect_amount,organic_units_amount';
-  for (let off = 0; off < 2000; off += 100) {
-    const r = await ml.apiH(conn, `/advertising/MLC/advertisers/${a.advertiser_id}/product_ads/ads/search?limit=100&offset=${off}&date_from=${dayStr(from)}&date_to=${dayStr(to)}&metrics=${metrics}`, { 'api-version': '2' });
-    const res = r?.results || [];
+  const q = off => `limit=100&offset=${off}&date_from=${dayStr(from)}&date_to=${dayStr(to)}&metrics=${metrics}`;
+  // Mercado Ads cambió de rutas en el tiempo: se prueban en orden y se usa la primera que responda
+  const routes = [
+    off => [`/advertising/${a.site_id || 'MLC'}/advertisers/${a.advertiser_id}/product_ads/ads/search?${q(off)}`, { 'api-version': '2' }],
+    off => [`/advertising/advertisers/${a.advertiser_id}/product_ads/ads/search?${q(off)}`, { 'api-version': '2' }],
+    off => [`/advertising/product_ads/ads/search?advertiser_id=${a.advertiser_id}&${q(off)}`, { 'api-version': '2' }],
+  ];
+  let route = null, lastErr = null;
+  for (const rt of routes) { try { const [pth, h] = rt(0); await ml.apiH(conn, pth, h); route = rt; break; } catch (e) { lastErr = e; } }
+  if (!route) throw lastErr || new Error('Mercado Ads sin respuesta');
+  for (let off = 0; off < 3000; off += 100) {
+    const [pth, h] = route(off);
+    const r = await ml.apiH(conn, pth, h);
+    const res = r?.results || r?.ads || [];
     for (const x of res) {
       const m = x.metrics || x.metrics_summary || {};
-      const cost = num(m.cost);
-      // TACOS = gasto en publicidad / ventas totales del producto (en %). Si no viene, se calcula.
-      let tacos = m.tacos != null ? num(m.tacos) : null;
-      const total = num(m.total_amount) + num(m.organic_units_amount);
-      if (tacos == null && total > 0) tacos = cost / total * 100;
-      out.set(String(x.item_id || x.id), { cost, tacos: tacos == null ? (cost > 0 ? null : 0) : tacos });
+      const id = String(x.item_id || x.item?.id || x.id || '');
+      if (!id) continue;
+      const prev = out.get(id) || { cost: 0, tacos: null };
+      const cost = prev.cost + num(m.cost);
+      // TACOS que informa Mercado Ads (neto, en %); si no viene se calcula con las ventas del producto
+      const tacos = m.tacos != null && m.tacos !== '' ? num(m.tacos) : prev.tacos;
+      out.set(id, { cost, tacos });
     }
     if (res.length < 100) break;
     await sleep(200);
   }
   return out;
+}
+
+// Ventas (con IVA) de cada publicación en los últimos 30 días, para calcular el TACOS cuando Mercado Ads no lo entrega
+function sales30(sellerId) {
+  const since = dayStr(new Date(Date.now() - 30 * 864e5));
+  const m = new Map();
+  for (const r of db.prepare("SELECT pub_id, SUM(amount) a FROM sale_items WHERE seller_id=? AND marketplace='ml' AND day>=? GROUP BY pub_id").all(sellerId, since)) m.set(String(r.pub_id), r.a || 0);
+  return m;
 }
 
 // ---------- Falabella / Paris: productos vendidos (últimos 90 días) con su precio promedio ----------
@@ -2721,6 +2744,8 @@ function groupByPublication(rows) {
     x.sold += r.sold || 0; x.units90 += r.units90 || 0;
     x.prices.set(r.price, (x.prices.get(r.price) || 0) + 1 + (r.sold || r.units90 || 0));
     if (!x.thumb && r.thumb) x.thumb = r.thumb;
+    if (r.ads_cost != null) { x._adc = (x._adc || 0) + r.ads_cost; x._ads = true; x.tacos_src = r.tacos_src; }
+    x._s30 = (x._s30 || 0) + (r.sales30 || 0);
     if (x.tacos == null && r.tacos != null) { x.tacos = r.tacos; x.tacos_src = r.tacos_src; }
   }
   return [...g.values()].map(x => {
@@ -2728,7 +2753,9 @@ function groupByPublication(rows) {
     const price = [...x.prices.entries()].sort((a, b) => b[1] - a[1])[0][0];
     const ref = rows.find(r => r.mk === x.mk && r.price === price && x.ids.includes(r.id)) || x;
     const out = { ...x, price, regular: ref.regular ?? null, base: ref.base ?? null, fee: ref.fee, ship: ref.ship, ship_src: ref.ship_src, id: x.ids[0] || '', sku: [...new Set(x.skus)].length === 1 ? x.skus[0] : (x.skus.length ? x.skus.length + ' SKU' : ''), url: ref.url || x.url };
-    delete out.prices; delete out.skus; delete out.family;
+    // TACOS de la publicación = gasto total en publicidad / ventas totales de todas sus variantes
+    if (x._ads && x._s30 > 0) out.tacos = Math.round(x._adc / x._s30 * 1000) / 10;
+    delete out.prices; delete out.skus; delete out.family; delete out._adc; delete out._ads; delete out._s30;
     if (x.mk === 'ml') out.title = x.family && x.variants > 1 ? x.title : x.title;
     return out;
   });
@@ -2753,13 +2780,14 @@ async function build(sellerId) {
       if (c.marketplace === 'pa') rows.push(...await paListings(conn, sellerId, errors));
     } catch (e) { errors.push(`${c.marketplace.toUpperCase()}: ${String(e.message).slice(0, 160)}`); }
   }
-  const data = { rows: groupByPublication(rows), errors, v: CACHE_V };
+  const data = { rows: groupByPublication(rows), errors: [...errors], v: CACHE_V, retry: Boolean(errors.adsAuth) };
   db.prepare('INSERT INTO profit_cache (seller_id, data, at) VALUES (?,?,?) ON CONFLICT(seller_id) DO UPDATE SET data=excluded.data, at=excluded.at').run(sellerId, JSON.stringify(data), Date.now());
   return data;
 }
 function refresh(sellerId, force) {
   const c = cached(sellerId);
-  const stale = !c || c.v !== CACHE_V || Date.now() - c.at > 6 * 3600e3;
+  // si Mercado Ads aún no daba permiso, se reintenta cada 45 minutos (los accesos se renuevan solos cada pocas horas)
+  const stale = !c || c.v !== CACHE_V || Date.now() - c.at > (c.retry ? 45 * 60e3 : 6 * 3600e3);
   if ((force || stale) && !building.has(sellerId)) {
     const p = build(sellerId).catch(e => console.warn('[ganancia]', e.message)).finally(() => building.delete(sellerId));
     building.set(sellerId, p);
