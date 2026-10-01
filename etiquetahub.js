@@ -714,9 +714,9 @@ function drawStrip(page, fonts, blocks, info, stripH, cont) {
   y -= 5;
   for (const b of blocks) {
     y -= b.lines[0].s;
-    page.drawRectangle({ x: PAD, y: y - 3, width: 22, height: 14, color: rgb(0, 0, 0) });
+    // cantidad sin recuadro, en negro y grande para que se lea bien al separar
     const qt = b.qty + 'x';
-    page.drawText(qt, { x: PAD + 11 - fonts.bold.widthOfTextAtSize(qt, 10) / 2, y: y, size: 10, font: fonts.bold, color: rgb(1, 1, 1) });
+    page.drawText(qt, { x: PAD, y: y - 1, size: 11, font: fonts.bold, color: rgb(0, 0, 0) });
     let first = true;
     for (const l of b.lines) {
       if (!first) y -= l.s + 2;
@@ -787,9 +787,9 @@ function drawOrderSheet(page, fonts, blocks, info, part, parts) {
     const top = y;
     if (b.missing) y -= 4;
     y -= b.lines[0].s + 2;
-    page.drawRectangle({ x: PAD, y: y - 3, width: 22, height: 14, color: black });
+    // cantidad sin recuadro, en negro y grande para que se lea bien al separar
     const qt = b.qty + 'x';
-    page.drawText(qt, { x: PAD + 11 - fonts.bold.widthOfTextAtSize(qt, 10) / 2, y, size: 10, font: fonts.bold, color: rgb(1, 1, 1) });
+    page.drawText(qt, { x: PAD + 2, y: y - 1, size: 11, font: fonts.bold, color: black });
     let first = true;
     for (const l of b.lines) {
       if (!first) y -= l.s + 2;
