@@ -1275,12 +1275,34 @@ async function buildFromShipment(conn, shipmentId, knownOrders = []) {
     const ids = new Set([sh.order_id, ...(sh.orders || []).map(o => o.id || o)].filter(Boolean));
     orders = await Promise.all([...ids].map(id => api(conn, `/orders/${id}`)));
   }
+  // Carrito (pack): el envío trae solo UNA de sus órdenes en order_id, así que se piden TODAS las órdenes del pack.
+  // Si no, el paquete aparecería con menos productos de los que compró el cliente.
+  const have = new Set(orders.map(o => String(o.id)));
+  for (const packId of [...new Set(orders.map(o => o.pack_id).filter(Boolean))]) {
+    try {
+      const pk = await api(conn, `/packs/${packId}`);
+      const missing = (pk?.orders || []).map(o => String(o.id || o)).filter(id => id && !have.has(id));
+      for (const id of missing) { try { const o = await api(conn, `/orders/${id}`); if (o && o.status !== 'cancelled') { orders.push(o); have.add(id); } } catch { /* sigue */ } }
+    } catch { /* sin acceso al pack: se usa el respaldo de abajo */ }
+  }
+  orders = orders.filter((o, i, a) => a.findIndex(x => String(x.id) === String(o.id)) === i);
   const items = [];
   for (const o of orders) for (const oi of o.order_items || []) {
     items.push({
       name: oi.item?.title, variant: variantText(oi.item || {}),
       sku: oi.item?.seller_sku || oi.item?.seller_custom_field || '', pub_id: oi.item?.id, qty: oi.quantity, up_id: oi.item?.user_product_id || undefined,
     });
+  }
+  // Respaldo: si el envío tiene más productos que las órdenes leídas, se agregan los que faltan desde el envío
+  const shItems = Array.isArray(sh.shipping_items) ? sh.shipping_items : [];
+  const shUnits = shItems.reduce((a, x) => a + Number(x.quantity || 1), 0), itUnits = items.reduce((a, x) => a + Number(x.qty || 1), 0);
+  if (shUnits > itUnits) {
+    const left = items.map(i => ({ ...i }));
+    for (const si of shItems) {
+      const k = left.findIndex(i => i.pub_id === si.id && (!si.user_product_id || !i.up_id || i.up_id === si.user_product_id) && i.qty > 0);
+      if (k >= 0) { left[k].qty -= Number(si.quantity || 1); continue; }
+      items.push({ name: si.description || 'Producto', variant: '', sku: '', pub_id: si.id, qty: Number(si.quantity || 1), up_id: si.user_product_id || undefined });
+    }
   }
   await addFamilyIds(conn, items);
   const first = orders[0] || {};
