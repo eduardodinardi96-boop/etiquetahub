@@ -1029,7 +1029,7 @@ async function buildFromShipment(conn, shipmentId, knownOrders = []) {
     cancelled: sh.status === 'cancelled' || orders.every(o => o.status === 'cancelled'),
     // Flex: sigue en "Etiquetas impresas" hasta que el cliente lo recibe; el resto sale cuando la agencia/centro lo recibe
     shipped: logistic === 'self_service' ? ['delivered'].includes(sh.status) : alreadyOut(sh),
-    meta: { status: sh.status, substatus: sh.substatus, buffered_until: sh.status === 'pending' && sh.substatus === 'buffered' ? (sh.shipping_option?.buffering?.date || null) : null, logistic, dispatch_by: dBy, ml_delayed: mlDelayed, out: alreadyOut(sh), customer: sh.receiver_address?.receiver_name || [first.buyer?.first_name, first.buyer?.last_name].filter(Boolean).join(' ') || first.buyer?.nickname || '' },
+    meta: { status: sh.status, substatus: sh.substatus, buffered_until: sh.status === 'pending' && sh.substatus === 'buffered' ? (sh.shipping_option?.buffering?.date || null) : null, logistic, dispatch_by: dBy, ml_delayed: mlDelayed, delivery_limit: sh.shipping_option?.estimated_delivery_limit?.date || sh.lead_time?.estimated_delivery_limit?.date || null, out: alreadyOut(sh), customer: sh.receiver_address?.receiver_name || [first.buyer?.first_name, first.buyer?.last_name].filter(Boolean).join(' ') || first.buyer?.nickname || '' },
   };
 }
 
@@ -3258,7 +3258,9 @@ function lateDeadline(mk, meta) {
   if (mk === 'ml' && meta.logistic === 'self_service') {
     // Flex: vale el primer plazo que dio Mercado Libre (si lo corrió a otro día es porque no se entregó a tiempo)
     const f = parseD(meta.dispatch_first); const base = f && f < d ? f : d;
-    return chileAt(chileDay(base), '23:00:00');
+    const dl = chileAt(chileDay(base), '23:00:00');
+    const lim = parseD(meta.delivery_limit); // límite de entrega que da Mercado Libre al comprador
+    return lim && lim < dl ? lim : dl;
   }
   return d;
 }
@@ -3266,14 +3268,17 @@ function isLate(o, meta) {
   if (['shipped', 'cancelled'].includes(o.state)) return false;
   // cancelada en el marketplace (aunque ya estuviera impresa) no es atrasada
   if (meta.status === 'cancelled' || meta.cancelled) return false;
-  if (meta.out) return false; // ya salió (la retiró el conductor Flex o la recibió la agencia)
+  // ya salió (la recibió la agencia/centro). Flex sigue contando hasta que se entrega al cliente
+  const flex = o.marketplace === 'ml' && meta.logistic === 'self_service';
+  if (meta.out && !flex) return false;
   if (meta.ml_delayed === true) return true; // Mercado Libre la marca atrasada
   const dl = lateDeadline(o.marketplace, meta);
   return Boolean(dl && dl < new Date());
 }
 // Plazo límite (para "Advertencia": faltan 30 minutos o menos) solo si el paquete aún puede atrasarse
 function warnDeadline(o, meta) {
-  if (['shipped', 'cancelled'].includes(o.state) || meta.status === 'cancelled' || meta.cancelled || meta.out) return null;
+  if (['shipped', 'cancelled'].includes(o.state) || meta.status === 'cancelled' || meta.cancelled) return null;
+  if (meta.out && !(o.marketplace === 'ml' && meta.logistic === 'self_service')) return null;
   return lateDeadline(o.marketplace, meta)?.toISOString() || null;
 }
 function dispatchView(mk, v) {
