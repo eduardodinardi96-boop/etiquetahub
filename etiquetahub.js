@@ -3255,12 +3255,12 @@ function lateDeadline(mk, meta) {
   const v = meta.dispatch_by; if (!v) return null;
   if (mk === 'pa') { const day = parisDay(v); return day ? chileAt(day, '23:59:59') : null; }
   const d = parseD(v); if (!d) return null;
+  // Falabella: escaneado por la agencia/Falabella dentro del día de su plazo
+  if (mk === 'fa') return chileAt(String(v).slice(0, 10), '23:59:59');
   if (mk === 'ml' && meta.logistic === 'self_service') {
     // Flex: vale el primer plazo que dio Mercado Libre (si lo corrió a otro día es porque no se entregó a tiempo)
     const f = parseD(meta.dispatch_first); const base = f && f < d ? f : d;
-    const dl = chileAt(chileDay(base), '23:00:00');
-    const lim = parseD(meta.delivery_limit); // límite de entrega que da Mercado Libre al comprador
-    return lim && lim < dl ? lim : dl;
+    return chileAt(chileDay(base), '23:00:00'); // Flex: entregado al cliente a las 23:00 del día de despacho
   }
   return d;
 }
