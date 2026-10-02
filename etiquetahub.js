@@ -1707,6 +1707,31 @@ function flatten(list) {
   return out;
 }
 
+// Paris no manda el color en la orden: se lee de la variante del producto (/v2/products/{id}) y se guarda
+const db = require('../db');
+db.exec('CREATE TABLE IF NOT EXISTS pa_variant (sku TEXT PRIMARY KEY, text TEXT, at INTEGER)');
+const VAR_ATTR = /^(color|colour|talla|tama[nñ]o|medida|dise[nñ]o|modelo|sabor|aroma|capacidad)/i;
+async function variantText(conn, sku) {
+  if (!sku) return '';
+  const c = db.prepare('SELECT text, at FROM pa_variant WHERE sku=?').get(sku);
+  if (c && (c.text || Date.now() - c.at < 864e5)) return c.text || '';
+  let text = '';
+  try {
+    const p = await api(conn, `/v2/products/${encodeURIComponent(String(sku).replace(/-\d+$/, ''))}`);
+    const prod = p?.results?.[0] || p?.data || p;
+    const v = (prod?.variants || []).find(x => String(x.sku) === String(sku));
+    // color primero, después talla y el resto
+    const attrs = (v?.attributes || []).filter(a => VAR_ATTR.test(a.name || '') && (a.optionName || a.value)).sort((x, y) => (/color/i.test(y.name) ? 1 : 0) - (/color/i.test(x.name) ? 1 : 0));
+    text = attrs.map(a => `${a.name}: ${a.optionName || a.value}`).join(' · ');
+  } catch (e) { console.warn('[Paris] variante', sku, e.message); }
+  db.prepare('INSERT OR REPLACE INTO pa_variant (sku, text, at) VALUES (?,?,?)').run(sku, text, Date.now());
+  return text;
+}
+async function withVariants(conn, items) {
+  for (const it of items) { const t = await variantText(conn, it.pub_id); if (t) it.variant = t; }
+  return items;
+}
+
 function itemsOf(list) {
   const g = new Map();
   for (const it of list || []) {
@@ -1719,17 +1744,17 @@ function itemsOf(list) {
 
 async function shipmentsOf(conn, sub) {
   const shipments = await api(conn, `/v2/shipments/${encodeURIComponent(sub.subOrderNumber)}`);
-  return (Array.isArray(shipments) ? shipments : []).map((sh, idx, all) => ({
+  return Promise.all((Array.isArray(shipments) ? shipments : []).map(async (sh, idx, all) => ({
     external_id: all.length > 1 ? `${sub.subOrderNumber}-${sh.id}` : String(sub.subOrderNumber),
     order_number: String(sub.subOrderNumber),
     sold_at: sub.originOrderDate || sub.createdAt,
-    items: itemsOf(sh.items?.length ? sh.items : sub.items),
+    items: await withVariants(conn, itemsOf(sh.items?.length ? sh.items : sub.items)),
     labelReady: Boolean(sh.labelId || sh.labelUrl),
     // cancelada en Paris: el envío queda en estado 18 o todos sus productos tienen motivo de cancelación
     cancelled: Number(sh.statusId) === 18 || (() => { const its = (sh.items?.length ? sh.items : sub.items) || []; return its.length > 0 && its.every(i => i.cancellationReasonId || i.cancellationReason); })(),
     shipped: Boolean(sh.effectiveDispatchDate),
     meta: { dispatch_by: sh.dispatchDateTime || (sh.dispatchDate ? sh.dispatchDate + ' 23:59:00' : null), labelId: sh.labelId || null, labelUrl: sh.labelUrl || null, carrier: sh.carrier, tracking: sh.trackingNumber || null, statusId: sh.statusId, shipmentId: sh.id, customer: sub.customer?.name || [sh.shippingAddress?.firstName, sh.shippingAddress?.lastName].filter(Boolean).join(' ') },
-  }));
+  })));
 }
 
 async function listShipments(conn) {
@@ -1779,7 +1804,7 @@ async function sales(conn, fromISO, toISO) {
         const k = it.sellerSku || it.sku || it.name;
         const qty = Number(it.quantity || 1);
         const line = Number(it.priceAfterDiscounts ?? it.grossPrice ?? 0) || Number(it.price ?? it.basePrice ?? 0) * qty;
-        if (!g.has(k)) g.set(k, { sku: it.sellerSku || '', pub_id: it.sku || '', name: it.name || 'Producto', variant: it.size ? `Talla/Tamaño: ${it.size}` : '', qty: 0, amount: 0 });
+        if (!g.has(k)) g.set(k, { sku: it.sellerSku || '', pub_id: it.sku || '', name: it.name || 'Producto', variant: (db.prepare('SELECT text FROM pa_variant WHERE sku=?').get(String(it.sku || ''))?.text) || (it.size ? `Talla/Tamaño: ${it.size}` : ''), qty: 0, amount: 0 });
         const x = g.get(k); x.qty += qty; x.amount += line;
       }
       const items = [...g.values()];
@@ -3076,6 +3101,11 @@ async function upsert(conn, s) {
     state = 'printed';
     db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by=? WHERE id=?`).run(`Impresa en ${MKNAME[mk] || 'el marketplace'}`, existing.id);
     logEvent(existing.seller_id, 'print', `Pedido ${existing.order_number}: impreso directamente en ${MKNAME[mk] || 'el marketplace'}`);
+  }
+  // si cambiaron los productos (p. ej. llegó el color o el resto del carrito) y aún no se imprime, la etiqueta se rehace
+  if (existing.items !== JSON.stringify(s.items) && existing.label_file && ['ready', 'waiting', 'error'].includes(state)) {
+    db.prepare('UPDATE orders SET label_file=NULL WHERE id=?').run(existing.id);
+    try { fs.unlinkSync(labelPath(existing.id)); } catch { /* no estaba */ }
   }
   db.prepare(`UPDATE orders SET items=?, meta=?, state=?, updated_at=datetime('now') WHERE id=?`)
     .run(JSON.stringify(s.items), JSON.stringify({ ...(s.meta || {}), cancelled: Boolean(s.cancelled), dispatch_first: firstDispatch(existing.meta, s.meta) }), state, existing.id);
