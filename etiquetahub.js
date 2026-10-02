@@ -32,6 +32,12 @@ const env = process.env;
 const cfg = {
   port: Number(env.PORT || 3000),
   baseUrl: (env.BASE_URL || env.RENDER_EXTERNAL_URL || `http://localhost:${env.PORT || 3000}`).replace(/\/$/, ''),
+  // URL interna de Render (respaldos entre versiones y visita de mantención); no depende del dominio propio
+  internalUrl: (env.RENDER_EXTERNAL_URL || env.BASE_URL || `http://localhost:${env.PORT || 3000}`).replace(/\/$/, ''),
+  // dirección de vuelta registrada en la app de Mercado Libre (por defecto, la URL pública)
+  mlBaseUrl: (env.ML_BASE_URL || env.BASE_URL || env.RENDER_EXTERNAL_URL || `http://localhost:${env.PORT || 3000}`).replace(/\/$/, ''),
+  // dominio propio (p. ej. etiquetahub.cl): las páginas abiertas en otra dirección se redirigen a él
+  canonicalHost: String(env.CANONICAL_HOST || '').trim().toLowerCase(),
   backupUrl: env.BACKUP_URL || (env.RENDER_GIT_REPO_SLUG ? `https://raw.githubusercontent.com/${env.RENDER_GIT_REPO_SLUG}/backup/db.enc` : ''),
   appSecret: env.APP_SECRET || '',
   dataDir: env.DATA_DIR || path.join(__dirname, '..', 'data'),
@@ -1210,7 +1216,7 @@ function authUrl(state) {
   const u = new URL('/authorization', cfg.ml.authHost);
   u.searchParams.set('response_type', 'code');
   u.searchParams.set('client_id', settings.mlClientId());
-  u.searchParams.set('redirect_uri', `${cfg.baseUrl}/auth/ml/callback`);
+  u.searchParams.set('redirect_uri', `${cfg.mlBaseUrl}/auth/ml/callback`);
   u.searchParams.set('state', state);
   return u.toString();
 }
@@ -1222,7 +1228,7 @@ async function tokenRequest(params) {
   }, { retries: 1 });
   return { access_token: t.access_token, refresh_token: t.refresh_token, user_id: String(t.user_id), expires_at: Date.now() + (t.expires_in - 300) * 1000 };
 }
-const exchangeCode = code => tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: `${cfg.baseUrl}/auth/ml/callback` });
+const exchangeCode = code => tokenRequest({ grant_type: 'authorization_code', code, redirect_uri: `${cfg.mlBaseUrl}/auth/ml/callback` });
 
 async function token(conn) {
   if (conn.creds.expires_at > Date.now()) return conn.creds.access_token;
@@ -5006,6 +5012,7 @@ async function route(req, res) {
       const me = await ml.whoAmI(conn).catch(() => null);
       if (me?.nickname) db.prepare('UPDATE connections SET account_label=? WHERE id=?').run(me.nickname, connId);
       sync.syncConnection(connId);
+      if (!user && cfg.canonicalHost && hostOf(req) !== cfg.canonicalHost) { res.writeHead(302, { location: `https://${cfg.canonicalHost}/?conectado=ml` }); return res.end(); }
       if (!user) return send(res, 200, `Listo: la cuenta de Mercado Libre${me?.nickname ? ' ' + me.nickname : ''} quedó conectada a EtiquetaHub. Ya puedes cerrar esta ventana.`);
       res.writeHead(302, { location: '/?conectado=ml' }); return res.end();
     } catch (e) {
@@ -5756,7 +5763,7 @@ async function route(req, res) {
         ml_client_id: settings.mlClientId(), ml_secret_set: Boolean(settings.mlClientSecret()),
         backup: backup.status(), gh_token_set: Boolean(settings.get('gh_token')),
         mail_from: recovery.mailConfig().from, mail_from_name: recovery.mailConfig().fromName, mail_key_set: Boolean(recovery.mailConfig().apiKey),
-        ml_redirect_uri: `${cfg.baseUrl}/auth/ml/callback`, ml_notifications_url: `${cfg.baseUrl}/webhooks/ml`, base_url: cfg.baseUrl,
+        ml_redirect_uri: `${cfg.mlBaseUrl}/auth/ml/callback`, ml_notifications_url: `${cfg.baseUrl}/webhooks/ml`, base_url: cfg.baseUrl,
       });
     }
     if (p === '/api/admin/settings' && m === 'POST') {
@@ -5898,7 +5905,19 @@ function bootstrap() {
 }
 
 bootstrap();
+const hostOf = req => String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().split(':')[0].toLowerCase();
+// Dominio propio: quien abre la app en la dirección antigua (onrender.com) pasa a la nueva.
+// No se tocan la API, los webhooks, el login de Mercado Libre, /health ni los respaldos.
+function canonicalRedirect(req, res) {
+  if (!cfg.canonicalHost || (req.method !== 'GET' && req.method !== 'HEAD')) return false;
+  const h = hostOf(req);
+  if (!h || h === cfg.canonicalHost || !h.endsWith('.onrender.com')) return false;
+  if (/^\/(api|webhooks|auth|health|backup)/.test(req.url)) return false;
+  res.writeHead(301, { location: `https://${cfg.canonicalHost}${req.url}` });
+  res.end(); return true;
+}
 http.createServer((req, res) => {
+  if (canonicalRedirect(req, res)) return;
   if (handoff.frozen()) {
     const u = new URL(req.url, cfg.baseUrl);
     if (isWrite(req, u.pathname, u)) {
@@ -5916,7 +5935,7 @@ http.createServer((req, res) => {
   sync.start();
   sales.start();
   // Render gratis se duerme sin visitas: la app se visita sola cada 4 minutos
-  if (process.env.RENDER_EXTERNAL_URL) setInterval(() => fetch(`${cfg.baseUrl}/health`).catch(() => {}), 4 * 60e3);
+  if (process.env.RENDER_EXTERNAL_URL) setInterval(() => fetch(`${cfg.internalUrl}/health`).catch(() => {}), 4 * 60e3);
 });
 
 };
@@ -5937,7 +5956,7 @@ async function restore() {
     try {
       // "handoff" firmado: congela la versión vieja para que nada de lo que se haga desde ahora se pierda
       const ts = Date.now(), hs = require('crypto').createHmac('sha256', require('./keys').KEY).update('handoff:' + ts).digest('hex');
-      const live = await fetch(`${cfg.baseUrl}/backup.enc?t=${ts}&ts=${ts}&handoff=${hs}`, { signal: AbortSignal.timeout(20000) });
+      const live = await fetch(`${cfg.internalUrl}/backup.enc?t=${ts}&ts=${ts}&handoff=${hs}`, { signal: AbortSignal.timeout(20000) });
       if (live.ok) {
         let plain = decryptBuf(Buffer.from(await live.arrayBuffer()));
         if (plain[0] === 0x1f && plain[1] === 0x8b) plain = require('zlib').gunzipSync(plain);
