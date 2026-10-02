@@ -1811,7 +1811,25 @@ async function debugOrder(conn, order) {
   } catch (e) { out.subOrderError = e.message; }
   return out;
 }
-module.exports = { raw: api, flatten, refresh, debugOrder, sales, test, listShipments, fetchLabel };
+// ---------- Control de stock (API de stock de Paris: GET/POST /v2/stock, por SKU Marketplace "MK…") ----------
+async function stockListings(conn) {
+  const out = [];
+  for (let offset = 0; offset < 20000; offset += 100) {
+    const r = await api(conn, `/v2/stock?limit=100&offset=${offset}`);
+    const list = r?.skus || r?.data || [];
+    for (const x of list) {
+      if (x.active === false) continue;
+      out.push({ ref: String(x.sku), sku: String(x.sku_seller || x.skuSeller || x.sellerSku || '').trim(), title: x.title || x.sku, qty: x.quantity ?? x.availableStock ?? null, full: Boolean(x.isFulfillment) });
+    }
+    if (list.length < 100) break;
+  }
+  return out;
+}
+async function setStock(conn, ref, qty) {
+  await api(conn, '/v2/stock', { method: 'POST', body: JSON.stringify({ skus: [{ sku: String(ref), quantity: Math.max(0, qty) }] }) });
+}
+
+module.exports = { stockListings, setStock, raw: api, flatten, refresh, debugOrder, sales, test, listShipments, fetchLabel };
 
 };
 
