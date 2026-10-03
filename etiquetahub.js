@@ -761,7 +761,19 @@ function loginFailed(key) {
 }
 function loginOk(key) { loginFails.delete(key); }
 
-module.exports = { requestCode, verifyCode, sendMail, mailConfig, mailConfigured, loginBlocked, loginFailed, loginOk };
+// Brevo desactiva las claves API sin uso por 90 días: una consulta liviana cada semana la mantiene activa
+async function keepAlive() {
+  const c = mailConfig(); if (!c.apiKey) return;
+  const last = Number(settings.get('mail_ping_at') || 0);
+  if (Date.now() - last < 7 * 864e5) return;
+  try {
+    await request((process.env.BREVO_API_URL || 'https://api.brevo.com/v3/smtp/email').replace(/\/smtp\/email$/, '/account'), { headers: { 'api-key': c.apiKey, accept: 'application/json' } }, { retries: 1 });
+    settings.set('mail_ping_at', String(Date.now()));
+  } catch (e) { console.warn('[Brevo] keepalive', e.message); }
+}
+function startKeepAlive() { setTimeout(keepAlive, 60e3); setInterval(keepAlive, 12 * 3600e3); }
+
+module.exports = { keepAlive, startKeepAlive, requestCode, verifyCode, sendMail, mailConfig, mailConfigured, loginBlocked, loginFailed, loginOk };
 
 };
 
@@ -5956,6 +5968,7 @@ http.createServer((req, res) => {
   console.log(`EtiquetaHub en ${cfg.baseUrl} (puerto ${cfg.port})${cfg.demo ? ' — MODO DEMO' : ''}`);
   sync.start();
   sales.start();
+  recovery.startKeepAlive();
   // Render gratis se duerme sin visitas: la app se visita sola cada 4 minutos
   if (process.env.RENDER_EXTERNAL_URL) setInterval(() => fetch(`${cfg.internalUrl}/health`).catch(() => {}), 4 * 60e3);
 });
