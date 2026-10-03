@@ -2583,8 +2583,16 @@ async function token(conn) {
   return r.access_token;
 }
 async function api(conn, path, opts = {}) {
-  const t = await token(conn);
-  return request(`${API()}${path}`, { ...opts, headers: { ...baseHeaders(), 'WM_SEC.ACCESS_TOKEN': t, 'content-type': 'application/json', ...(opts.headers || {}) } }, opts.method && opts.method !== 'GET' ? { retries: 0 } : undefined);
+  const call = async () => request(`${API()}${path}`, { ...opts, headers: { ...baseHeaders(), 'WM_SEC.ACCESS_TOKEN': await token(conn), ...(process.env.WALMART_CHANNEL ? { 'WM_CONSUMER.CHANNEL.TYPE': process.env.WALMART_CHANNEL } : {}), 'content-type': 'application/json', ...(opts.headers || {}) } }, opts.method && opts.method !== 'GET' ? { retries: 0 } : undefined);
+  for (let i = 0; ; i++) {
+    try { return await call(); } catch (e) {
+      // token vencido o anulado por Walmart: se pide uno nuevo una vez
+      if (e.status === 401 && i === 0) { conn.saveCreds({ ...conn.creds, token: null, token_exp: 0 }); continue; }
+      // Walmart responde 404 cuando una lista viene vacía (cuenta nueva sin pedidos o sin productos): no es un error
+      if (e.status === 404 && (!opts.method || opts.method === 'GET') && /CONTENT_NOT_FOUND|not ?found|no (orders|items)/i.test(String(e.body || ''))) return null;
+      throw e;
+    }
+  }
 }
 
 async function test(conn) { await token(conn); return { sellerName: null }; }
@@ -6285,6 +6293,15 @@ async function route(req, res) {
       try { return ok(res, await sync.connectors[c.marketplace].debugList(sync.connObj(c))); } catch (e) { return fail(res, 500, e.message); }
     }
     // consulta directa a la API de Mercado Libre (solo lectura, administrador) para diagnosticar
+    // conexiones de un marketplace en TODAS las empresas, con su último error y los eventos recientes (sin claves)
+    if (p === '/api/admin/debug/conns' && m === 'GET') {
+      const mk = String(url.searchParams.get('mk') || 'wm');
+      const list = db.prepare(`SELECT c.id, c.seller_id, se.name seller, se.space_id, c.account_label, c.last_sync_at, c.last_error, c.created_at FROM connections c JOIN sellers se ON se.id=c.seller_id WHERE c.marketplace=? ORDER BY c.id DESC`).all(mk);
+      const sids = [...new Set(list.map(c => c.seller_id))];
+      const ev = sids.length ? db.prepare(`SELECT seller_id, kind, message, at FROM events WHERE seller_id IN (${sids.map(() => '?').join(',')}) ORDER BY id DESC LIMIT 40`).all(...sids) : [];
+      const evMk = db.prepare("SELECT seller_id, kind, message, at FROM events WHERE message LIKE ? ORDER BY id DESC LIMIT 30").all('%' + require('./marketplaces').name(mk).split(' ')[0] + '%');
+      return ok(res, { list, events: ev, mentions: evMk });
+    }
     if (p === '/api/admin/debug/claimsend' && m === 'GET') return ok(res, { list: require('./mkp').lastClaimSend });
     const dbr = p.match(/^\/api\/admin\/debug\/mlget\/(\d+)$/);
     if (dbr && m === 'GET') {
