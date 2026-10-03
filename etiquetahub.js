@@ -5377,6 +5377,9 @@ async function route(req, res) {
 
   if (p === '/health') return ok(res, { ok: true, demo: cfg.demo, v: appVersion() });
 
+  // Ayudante de Mercado Libre para Claude (conector MCP + inicio de sesión OAuth)
+  if (require('./ayudante').isMine(p)) return require('./ayudante').handle(req, res, url);
+
   // Respaldo cifrado de la base de datos (lo guarda GitHub Actions; sin APP_SECRET es ilegible)
   if (p === '/backup.enc' && m === 'GET') {
     // Traspaso a una versión nueva: la versión nueva pide la base firmada con "handoff". Desde ese momento esta
@@ -6516,7 +6519,7 @@ function canonicalRedirect(req, res) {
   if (!cfg.canonicalHost || (req.method !== 'GET' && req.method !== 'HEAD')) return false;
   const h = hostOf(req);
   if (!h || h === cfg.canonicalHost || !h.endsWith('.onrender.com')) return false;
-  if (/^\/(api|webhooks|auth|health|backup)/.test(req.url)) return false;
+  if (/^\/(api|webhooks|auth|health|backup|mcp|oauth|\.well-known)/.test(req.url)) return false;
   res.writeHead(301, { location: `https://${cfg.canonicalHost}${req.url}` });
   res.end(); return true;
 }
@@ -6542,6 +6545,695 @@ http.createServer((req, res) => {
   // Render gratis se duerme sin visitas: la app se visita sola cada 4 minutos
   if (process.env.RENDER_EXTERNAL_URL) setInterval(() => fetch(`${cfg.internalUrl}/health`).catch(() => {}), 4 * 60e3);
 });
+
+};
+
+__defs["ayudante"] = function (module, exports, require, __dirname) {
+// Ayudante de Mercado Libre para Claude (conector MCP remoto).
+// - Solo lo usan los dueños de la app (superadmin), con su correo y contraseña de EtiquetaHub (OAuth).
+// - Solo ve las cuentas de Mercado Libre que el dueño marcó como "suyas" (Notificaciones de ventas).
+// - Todo cambio: primero se PROPONE (antes → después + código) y solo se aplica con confirmar_cambio.
+// - Nunca baja un precio más de 15% de una vez. Cada cambio queda registrado y se puede deshacer.
+// - Modo prueba: mientras esté activo, solo se puede cambiar UNA publicación elegida.
+// - El fulfillment no tiene acceso: no hay pantallas nuevas y el login exige ser dueño.
+const crypto = require('crypto');
+const db = require('./db');
+const sec = require('./security');
+const ml = require('./connectors/ml');
+const sync = require('./sync');
+const recovery = require('./recovery');
+
+const MAX_BAJA = 0.15;           // máximo 15% de baja de precio por cambio
+const ALERTA_GASTO = 5000;       // alerta: campaña que gasta más que esto en un día sin ventas
+const PROPUESTA_MIN = 30;        // minutos que dura una propuesta sin confirmar
+const ACCESS_DAYS = 7, REFRESH_DAYS = 90;
+const VERSIONES = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS ayudante_tokens (hash TEXT PRIMARY KEY, kind TEXT NOT NULL, user_id INTEGER NOT NULL, client_id TEXT, pw TEXT, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS ayudante_propuestas (codigo TEXT PRIMARY KEY, user_id INTEGER NOT NULL, conn_id INTEGER, tipo TEXT NOT NULL, objetivo TEXT, antes TEXT, despues TEXT, resumen TEXT, deshace INTEGER, expires_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS ayudante_cambios (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT DEFAULT (datetime('now')), user_email TEXT, conn_id INTEGER, cuenta TEXT, tipo TEXT NOT NULL, objetivo TEXT, antes TEXT, despues TEXT, resumen TEXT, estado TEXT NOT NULL, error TEXT, deshace INTEGER, deshecho_por INTEGER);
+CREATE TABLE IF NOT EXISTS ayudante_config (key TEXT PRIMARY KEY, value TEXT);
+`);
+
+// ---------- utilidades ----------
+const h256 = s => crypto.createHash('sha256').update(String(s)).digest('hex');
+const now = () => Date.now();
+const clp = n => n == null || isNaN(n) ? '—' : '$' + Math.round(Number(n)).toLocaleString('es-CL');
+const pwFp = u => h256('pw:' + u.pass_hash).slice(0, 16);
+function cfgGet(k, d = null) { const r = db.prepare('SELECT value FROM ayudante_config WHERE key=?').get(k); return r ? JSON.parse(r.value) : d; }
+function cfgSet(k, v) { db.prepare('INSERT OR REPLACE INTO ayudante_config (key, value) VALUES (?,?)').run(k, JSON.stringify(v)); }
+// Modo prueba: por defecto ACTIVO. { activo: true, publicacion: 'MLC123' | null }
+const prueba = () => cfgGet('modo_prueba', { activo: true, publicacion: null });
+
+// Fechas en hora de Chile
+const TZ = 'America/Santiago';
+const dayCL = (d = new Date()) => new Intl.DateTimeFormat('en-CA', { timeZone: TZ }).format(d);
+function offsetMin(d) {
+  const s = new Intl.DateTimeFormat('en-US', { timeZone: TZ, timeZoneName: 'shortOffset' }).formatToParts(d).find(p => p.type === 'timeZoneName').value; // "GMT-3"
+  const m = s.match(/GMT([+-]\d+)(?::(\d+))?/); return m ? Number(m[1]) * 60 + Math.sign(Number(m[1])) * Number(m[2] || 0) : 0;
+}
+// inicio del día (hora Chile) en UTC
+function startOfDayUTC(day) {
+  const guess = new Date(day + 'T12:00:00Z');
+  return new Date(Date.parse(day + 'T00:00:00Z') - offsetMin(guess) * 60e3);
+}
+const addDays = (day, n) => dayCL(new Date(Date.parse(day + 'T12:00:00Z') + n * 864e5));
+const ayer = () => addDays(dayCL(), -1);
+function normDay(v, def) {
+  if (!v) return def;
+  const s = String(v).trim().toLowerCase();
+  if (s === 'hoy') return dayCL();
+  if (s === 'ayer') return ayer();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  throw uerr('Fecha inválida: usa el formato AAAA-MM-DD, "hoy" o "ayer".');
+}
+const uerr = m => Object.assign(new Error(m), { user: true });
+const normId = v => { const s = String(v || '').trim().toUpperCase().replace(/[\s-]/g, ''); return /^\d+$/.test(s) ? 'MLC' + s : s; };
+
+// ---------- usuario y cuentas ----------
+function userById(id) { return db.prepare('SELECT * FROM users WHERE id=?').get(id); }
+// Las cuentas "propias" del dueño (mismo criterio que las notificaciones de ventas de EtiquetaHub)
+function misSellers(user) {
+  const space = new Set(db.prepare('SELECT id FROM sellers WHERE space_id=?').all(user.space_id || 1).map(r => r.id));
+  const pref = db.prepare("SELECT value FROM user_prefs WHERE user_id=? AND key='notif_sellers'").get(user.id);
+  if (pref) { try { return JSON.parse(pref.value).map(Number).filter(id => space.has(id)); } catch { /* sigue */ } }
+  if ((user.space_id || 1) !== 1) return [...space];
+  const key = String(user.name || '').trim().toLowerCase().split(/\s+/)[0].slice(0, 4);
+  return key.length >= 3 ? db.prepare('SELECT id, name FROM sellers').all().filter(x => space.has(x.id) && x.name.toLowerCase().split(/\s+/).some(w => w.startsWith(key))).map(x => x.id) : [];
+}
+function misCuentas(user) {
+  const ids = misSellers(user);
+  if (!ids.length) return [];
+  return db.prepare(`SELECT c.*, s.name seller_name FROM connections c JOIN sellers s ON s.id=c.seller_id WHERE c.marketplace='ml' AND c.seller_id IN (${ids.map(() => '?').join(',')}) ORDER BY c.id`).all(...ids);
+}
+function cuenta(user, sel) {
+  const list = misCuentas(user);
+  if (!list.length) throw uerr('No encontré cuentas de Mercado Libre tuyas. En EtiquetaHub, en "Notificaciones de ventas", marca cuáles cuentas son tuyas y vuelve a intentar.');
+  let row;
+  if (sel == null || sel === '') {
+    if (list.length > 1) throw uerr('Tienes varias cuentas de Mercado Libre. Indica cuál (parámetro "cuenta"): ' + list.map(c => `${c.id} = ${c.seller_name}${c.account_label ? ' (' + c.account_label + ')' : ''}`).join(' · '));
+    row = list[0];
+  } else {
+    const s = String(sel).trim().toLowerCase();
+    row = list.find(c => String(c.id) === s) || list.find(c => [c.seller_name, c.account_label].filter(Boolean).some(n => n.toLowerCase() === s)) || list.find(c => [c.seller_name, c.account_label].filter(Boolean).some(n => n.toLowerCase().includes(s)));
+    if (!row) throw uerr('No encontré esa cuenta. Tus cuentas: ' + list.map(c => `${c.id} = ${c.seller_name}`).join(' · '));
+  }
+  const conn = sync.connObj(row);
+  conn.nombre = row.seller_name + (row.account_label ? ' (' + row.account_label + ')' : '');
+  return conn;
+}
+const uid = conn => conn.creds.user_id;
+
+// ---------- Mercado Libre: publicaciones ----------
+const ATTRS = 'id,title,price,original_price,base_price,currency_id,available_quantity,sold_quantity,status,sub_status,permalink,variations,shipping,listing_type_id,seller_custom_field,attributes,family_name,user_product_id';
+async function items(conn, ids) {
+  const out = [];
+  for (let i = 0; i < ids.length; i += 20) {
+    const r = await ml.raw(conn, `/items?ids=${ids.slice(i, i + 20).join(',')}&attributes=${ATTRS}&include_attributes=all`);
+    for (const x of r || []) if (x?.code === 200 && x.body) out.push(x.body);
+  }
+  return out;
+}
+async function item(conn, id) {
+  const it = await ml.raw(conn, `/items/${normId(id)}?include_attributes=all`).catch(e => { throw uerr(`No pude leer la publicación ${normId(id)}: ${e.message.slice(0, 160)}`); });
+  if (String(it.seller_id) !== String(uid(conn))) throw uerr('Esa publicación no es de esta cuenta.');
+  return it;
+}
+const skuOf = x => x?.seller_custom_field || (x?.attributes || []).find(a => a.id === 'SELLER_SKU')?.value_name || '';
+const varName = v => (v.attribute_combinations || []).map(a => a.value_name).filter(Boolean).join(' / ');
+const isFull = it => it.shipping?.logistic_type === 'fulfillment';
+function resumenItem(it) {
+  const vars = (it.variations || []).map(v => ({ variacion_id: v.id, nombre: varName(v), precio: v.price, stock: v.available_quantity, sku: skuOf(v) }));
+  return {
+    id: it.id, titulo: it.title, precio: it.price, precio_antes_de_promocion: it.original_price || null, stock: it.available_quantity,
+    vendidos: it.sold_quantity, estado: it.status === 'active' ? 'activa' : it.status === 'paused' ? 'pausada' : it.status,
+    full: isFull(it), sku: skuOf(it), tipo: it.listing_type_id === 'gold_pro' ? 'Premium' : it.listing_type_id === 'gold_special' ? 'Clásica' : it.listing_type_id,
+    link: it.permalink, ...(vars.length ? { variaciones: vars } : {}),
+  };
+}
+async function buscarIds(conn, { estado = 'active', buscar, limite = 50, offset = 0 }) {
+  const st = { activa: 'active', activas: 'active', pausada: 'paused', pausadas: 'paused', todas: '' }[String(estado).toLowerCase()] ?? estado;
+  const q = new URLSearchParams({ limit: String(Math.min(100, limite)), offset: String(offset) });
+  if (st) q.set('status', st);
+  if (buscar) { const b = String(buscar).trim(); if (/^MLC?\d+$/i.test(b)) return { ids: [normId(b)], total: 1 }; q.set('q', b); }
+  const r = await ml.raw(conn, `/users/${uid(conn)}/items/search?${q}`);
+  return { ids: r?.results || [], total: r?.paging?.total ?? (r?.results || []).length };
+}
+async function descripcion(conn, id) {
+  try { const d = await ml.raw(conn, `/items/${id}/description`); return d?.plain_text ?? ''; } catch (e) { if (e.status === 404) return ''; throw e; }
+}
+
+// ---------- Mercado Ads ----------
+const ADS_METRICS = 'clicks,prints,cost,cpc,acos,units_quantity,direct_units_quantity,indirect_units_quantity,total_amount,direct_amount,indirect_amount';
+let advCache = new Map();
+async function advertiser(conn) {
+  const k = conn.row.id;
+  if (advCache.has(k)) return advCache.get(k);
+  const r = await ml.apiH(conn, '/advertising/advertisers?product_id=PADS', { 'Api-Version': '1' });
+  const list = r?.advertisers || [];
+  const a = list.find(x => x.site_id === 'MLC') || list[0];
+  if (!a) throw uerr('Esta cuenta no tiene Mercado Ads (Product Ads) activo, o la app de Mercado Libre no tiene permiso de Publicidad.');
+  advCache.set(k, a); return a;
+}
+// Mercado Ads ha cambiado sus rutas: se prueban en orden y se recuerda la que funciona
+let campRoute = null;
+async function campanas(conn, desde, hasta, { diario = false } = {}) {
+  const a = await advertiser(conn), site = a.site_id || 'MLC';
+  const qs = off => `limit=50&offset=${off}&date_from=${desde}&date_to=${hasta}&metrics=${ADS_METRICS}${diario ? '&aggregation_type=DAILY' : ''}`;
+  const routes = [
+    off => `/advertising/${site}/advertisers/${a.advertiser_id}/product_ads/campaigns/search?${qs(off)}`,
+    off => `/advertising/advertisers/${a.advertiser_id}/product_ads/campaigns?${qs(off)}`,
+    off => `/marketplace/advertising/${site}/advertisers/${a.advertiser_id}/product_ads/campaigns/search?${qs(off)}`,
+  ];
+  const order = campRoute != null ? [campRoute, ...routes.keys()].filter((v, i, x) => x.indexOf(v) === i) : [...routes.keys()];
+  let last;
+  for (const ri of order) {
+    try {
+      const out = [];
+      for (let off = 0; off < 1000; off += 50) {
+        const r = await ml.apiH(conn, routes[ri](off), { 'api-version': '2' });
+        const res = r?.results || r?.campaigns || [];
+        out.push(...res);
+        if (res.length < 50) break;
+      }
+      campRoute = ri; return out;
+    } catch (e) { last = e; }
+  }
+  throw uerr('Mercado Ads no respondió: ' + String(last?.message || '').slice(0, 200));
+}
+const units = m => Number(m.units_quantity ?? (Number(m.direct_units_quantity || 0) + Number(m.indirect_units_quantity || 0))) || 0;
+function resumenCamp(c) {
+  const m = c.metrics || c.metrics_summary || {};
+  return {
+    id: c.id ?? c.campaign_id, nombre: c.name, estado: c.status === 'active' ? 'activa' : c.status === 'paused' ? 'pausada' : c.status,
+    presupuesto_diario: c.budget ?? null, acos_objetivo: c.acos_target ?? null, estrategia: c.strategy ?? null,
+    gasto: Math.round(Number(m.cost || 0)), ventas_unidades: units(m), ventas_monto: Math.round(Number(m.total_amount ?? (Number(m.direct_amount || 0) + Number(m.indirect_amount || 0))) || 0),
+    clics: Number(m.clicks || 0), impresiones: Number(m.prints || 0), acos: m.acos != null ? Number(m.acos) : null,
+  };
+}
+async function campana(conn, id) {
+  const hoy = dayCL();
+  const list = await campanas(conn, addDays(hoy, -6), hoy);
+  const c = list.find(x => String(x.id ?? x.campaign_id) === String(id));
+  if (!c) throw uerr('No encontré esa campaña en esta cuenta.');
+  return c;
+}
+async function ponerCampana(conn, id, body) {
+  const a = await advertiser(conn), site = a.site_id || 'MLC';
+  const tries = [
+    [`/marketplace/advertising/${site}/product_ads/campaigns/${id}`, { 'api-version': '2' }],
+    [`/advertising/${site}/product_ads/campaigns/${id}`, { 'api-version': '2' }],
+    [`/advertising/product_ads/campaigns/${id}`, { 'api-version': '2' }],
+  ];
+  let last;
+  for (const [p, h] of tries) {
+    try {
+      const tk = await tokenOf(conn);
+      const res = await fetch(`${require('./config').ml.apiHost}${p}`, { method: 'PUT', headers: { authorization: `Bearer ${tk}`, 'content-type': 'application/json', accept: 'application/json', ...h }, body: JSON.stringify(body), signal: AbortSignal.timeout(30000) });
+      const t = await res.text();
+      if (res.ok) return;
+      last = new Error(`HTTP ${res.status}: ${t.slice(0, 200)}`);
+      if (res.status !== 404 && res.status !== 405) break; // la ruta existe pero rechazó el cambio: no seguir probando
+    } catch (e) { last = e; }
+  }
+  throw last;
+}
+// token vigente (reusa la lógica de EtiquetaHub: renueva si venció)
+async function tokenOf(conn) { await ml.raw(conn, '/users/me'); return conn.creds.access_token; }
+
+// ---------- propuestas y cambios ----------
+function testGuard(tipo, objetivo) {
+  const mp = prueba();
+  if (!mp.activo) return;
+  if (tipo === 'modo_prueba') return;
+  if (tipo === 'campana') throw uerr('Estás en MODO PRUEBA: por ahora solo se puede cambiar la publicación de prueba. Los ajustes de campañas se habilitan al terminar el modo prueba (herramienta modo_prueba, acción "terminar").');
+  if (!mp.publicacion) throw uerr('Estás en MODO PRUEBA y aún no eliges la publicación de prueba. Usa la herramienta modo_prueba con acción "elegir" y el ID de UNA publicación.');
+  if (normId(objetivo) !== mp.publicacion) throw uerr(`Estás en MODO PRUEBA: solo se puede cambiar la publicación ${mp.publicacion}. Para usarlo en toda la cuenta, termina el modo prueba.`);
+}
+function proponer(user, conn, tipo, objetivo, antes, despues, resumen, deshace = null) {
+  testGuard(tipo, objetivo);
+  db.prepare('DELETE FROM ayudante_propuestas WHERE expires_at < ?').run(now());
+  const codigo = 'C-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+  db.prepare('INSERT INTO ayudante_propuestas (codigo,user_id,conn_id,tipo,objetivo,antes,despues,resumen,deshace,expires_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(codigo, user.id, conn ? conn.row.id : null, tipo, objetivo, JSON.stringify(antes), JSON.stringify(despues), resumen, deshace, now() + PROPUESTA_MIN * 60e3);
+  return {
+    propuesta: codigo, cuenta: conn?.nombre || null, cambio: resumen, antes, despues,
+    importante: `NADA HA CAMBIADO TODAVÍA. Muéstrale al usuario el antes y el después y pregúntale si confirma. Solo si el usuario responde que sí, llama a confirmar_cambio con codigo="${codigo}". La propuesta vence en ${PROPUESTA_MIN} minutos.`,
+  };
+}
+function precioGuard(antes, nuevo) {
+  if (!(nuevo > 0)) throw uerr('El precio nuevo debe ser mayor que 0.');
+  if (antes > 0 && nuevo < antes * (1 - MAX_BAJA) - 0.5) {
+    const min = Math.ceil(antes * (1 - MAX_BAJA));
+    throw uerr(`Regla de seguridad: no se puede bajar un precio más de 15% de una vez. Precio actual ${clp(antes)}; lo más bajo permitido ahora es ${clp(min)}.`);
+  }
+}
+
+async function aplicar(conn, p) {
+  const a = JSON.parse(p.antes), d = JSON.parse(p.despues), id = p.objetivo;
+  switch (p.tipo) {
+    case 'precio': {
+      const it = await item(conn, id);
+      // revisa que nadie lo haya cambiado entre la propuesta y la confirmación
+      const actual = (it.variations || []).length ? Math.min(...it.variations.map(v => v.price)) : it.price;
+      const antesMin = a.variaciones ? Math.min(...a.variaciones.map(v => v.precio)) : a.precio;
+      if (Math.round(actual) !== Math.round(antesMin)) throw uerr(`El precio cambió desde la propuesta (ahora ${clp(actual)}). Pide una propuesta nueva.`);
+      precioGuard(antesMin, d.variaciones ? Math.min(...d.variaciones.map(v => v.precio)) : d.precio);
+      if (d.variaciones) await ml.apiSend(conn, 'PUT', `/items/${id}`, { variations: d.variaciones.map(v => ({ id: v.variacion_id, price: v.precio })) });
+      else await ml.apiSend(conn, 'PUT', `/items/${id}`, { price: d.precio });
+      return;
+    }
+    case 'stock': {
+      const it = await item(conn, id);
+      if (isFull(it)) throw uerr('Esta publicación está en Full: el stock lo maneja Mercado Libre.');
+      if (d.variacion_id) await ml.apiSend(conn, 'PUT', `/items/${id}`, { variations: [{ id: Number(d.variacion_id), available_quantity: d.stock }] });
+      else await ml.apiSend(conn, 'PUT', `/items/${id}`, { available_quantity: d.stock });
+      return;
+    }
+    case 'titulo': await ml.apiSend(conn, 'PUT', `/items/${id}`, { title: d.titulo }); return;
+    case 'descripcion': await ml.apiSend(conn, 'PUT', `/items/${id}/description?api_version=2`, { plain_text: d.descripcion }); return;
+    case 'estado': await ml.apiSend(conn, 'PUT', `/items/${id}`, { status: d.estado === 'activa' ? 'active' : 'paused' }); return;
+    case 'campana': {
+      const body = {};
+      if (d.presupuesto_diario != null) body.budget = d.presupuesto_diario;
+      if (d.acos_objetivo != null) body.acos_target = d.acos_objetivo;
+      if (d.estado != null) body.status = d.estado === 'activa' ? 'active' : 'paused';
+      await ponerCampana(conn, id, body); return;
+    }
+    case 'modo_prueba': cfgSet('modo_prueba', d); return;
+    default: throw uerr('Tipo de cambio desconocido.');
+  }
+}
+
+// ---------- herramientas ----------
+const S = (props, req = []) => ({ type: 'object', properties: props, required: req, additionalProperties: false });
+const P_CUENTA = { cuenta: { type: 'string', description: 'Cuenta de Mercado Libre (número o nombre que entrega "cuentas"). Opcional si tienes una sola.' } };
+const P_PUB = { publicacion: { type: 'string', description: 'ID de la publicación, ej. MLC1234567890' } };
+const RO = { readOnlyHint: true, openWorldHint: true };
+const PROP = { readOnlyHint: true, openWorldHint: false };
+const NOTA_PROP = ' NO cambia nada: solo crea una propuesta (antes → después) que el usuario debe aprobar; luego se aplica con confirmar_cambio.';
+
+const TOOLS = [
+  { name: 'cuentas', title: 'Mis cuentas', description: 'Lista tus cuentas de Mercado Libre conectadas en EtiquetaHub y si está activo el modo prueba.', inputSchema: S({}), annotations: RO,
+    run: async u => ({ cuentas: misCuentas(u).map(c => ({ cuenta: String(c.id), nombre: c.seller_name, etiqueta: c.account_label || null })), modo_prueba: prueba() }) },
+
+  { name: 'ver_ventas', title: 'Ver ventas', description: 'Ventas de Mercado Libre entre dos días (hora de Chile): total, cantidad de ventas, unidades y productos más vendidos. Fechas AAAA-MM-DD, "hoy" o "ayer".', annotations: RO,
+    inputSchema: S({ ...P_CUENTA, desde: { type: 'string', description: 'Día inicial (por defecto: ayer)' }, hasta: { type: 'string', description: 'Día final, inclusive (por defecto: igual a desde)' }, detalle: { type: 'boolean', description: 'true = incluir la lista de cada venta' } }),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta);
+      const desde = normDay(a.desde, ayer()), hasta = normDay(a.hasta, desde);
+      const list = await ml.sales(conn, startOfDayUTC(desde).toISOString(), new Date(startOfDayUTC(addDays(hasta, 1)) - 1000).toISOString());
+      const top = new Map();
+      for (const s of list) for (const i of s.items) { const k = i.pub_id + '|' + i.variant; const x = top.get(k) || { publicacion: i.pub_id, producto: i.name + (i.variant ? ' · ' + i.variant : ''), unidades: 0, monto: 0 }; x.unidades += i.qty; x.monto += i.amount; top.set(k, x); }
+      return {
+        cuenta: conn.nombre, desde, hasta, ventas: list.length, unidades: list.reduce((s, x) => s + x.units, 0), total: Math.round(list.reduce((s, x) => s + x.amount, 0)),
+        mas_vendidos: [...top.values()].sort((x, y) => y.unidades - x.unidades).slice(0, 15),
+        ...(a.detalle ? { detalle: list.slice(0, 200).map(s => ({ venta: s.pack || s.id, fecha: s.at, monto: s.amount, productos: s.items.map(i => `${i.qty} × ${i.name}${i.variant ? ' · ' + i.variant : ''}`) })) } : {}),
+      };
+    } },
+
+  { name: 'resumen_ayer', title: 'Resumen de ayer', description: 'Resumen del día anterior (o del día indicado): ventas, unidades, gasto en publicidad, ACOS del día y alertas de campañas.', annotations: RO,
+    inputSchema: S({ ...P_CUENTA, dia: { type: 'string', description: 'Día a resumir (por defecto: ayer)' } }),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), dia = normDay(a.dia, ayer());
+      const list = await ml.sales(conn, startOfDayUTC(dia).toISOString(), new Date(startOfDayUTC(addDays(dia, 1)) - 1000).toISOString());
+      const total = Math.round(list.reduce((s, x) => s + x.amount, 0));
+      let pub = null, alertas = [], errPub = null;
+      try {
+        const cs = (await campanas(conn, dia, dia)).map(resumenCamp);
+        const gasto = cs.reduce((s, c) => s + c.gasto, 0);
+        pub = { gasto, ventas_por_publicidad: cs.reduce((s, c) => s + c.ventas_monto, 0), gasto_sobre_ventas_totales: total ? Math.round(gasto / total * 1000) / 10 + '%' : null,
+          campanas: cs.filter(c => c.gasto > 0).sort((x, y) => y.gasto - x.gasto).map(c => ({ id: c.id, nombre: c.nombre, gasto: c.gasto, unidades: c.ventas_unidades })) };
+        alertas = cs.filter(c => c.gasto > ALERTA_GASTO && c.ventas_unidades === 0).map(c => `⚠️ ${c.nombre}: gastó ${clp(c.gasto)} sin ventas`);
+      } catch (e) { errPub = e.message; }
+      return { cuenta: conn.nombre, dia, ventas: list.length, unidades: list.reduce((s, x) => s + x.units, 0), total, publicidad: pub, alertas, ...(errPub ? { error_publicidad: errPub } : {}) };
+    } },
+
+  { name: 'ver_publicaciones', title: 'Ver publicaciones', description: 'Busca y lista publicaciones con precio, stock y estado. Se puede buscar por texto del título, SKU o ID.', annotations: RO,
+    inputSchema: S({ ...P_CUENTA, estado: { type: 'string', enum: ['activa', 'pausada', 'todas'], description: 'Por defecto: activa' }, buscar: { type: 'string', description: 'Texto, SKU o ID' }, limite: { type: 'integer', minimum: 1, maximum: 100, description: 'Por defecto 30' }, desde_posicion: { type: 'integer', minimum: 0 } }),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta);
+      const { ids, total } = await buscarIds(conn, { estado: a.estado || 'activa', buscar: a.buscar, limite: a.limite || 30, offset: a.desde_posicion || 0 });
+      return { cuenta: conn.nombre, total, publicaciones: (await items(conn, ids)).map(resumenItem) };
+    } },
+
+  { name: 'ver_publicacion', title: 'Ver una publicación', description: 'Detalle completo de una publicación: título, precio, stock por variación, estado y descripción.', annotations: RO,
+    inputSchema: S({ ...P_CUENTA, ...P_PUB }, ['publicacion']),
+    run: async (u, a) => { const conn = cuenta(u, a.cuenta); const it = await item(conn, a.publicacion); return { cuenta: conn.nombre, ...resumenItem(it), descripcion: await descripcion(conn, it.id) }; } },
+
+  { name: 'ver_stock', title: 'Ver stock', description: 'Publicaciones activas con stock igual o menor al límite indicado (por defecto 5), incluyendo variaciones.', annotations: RO,
+    inputSchema: S({ ...P_CUENTA, maximo: { type: 'integer', minimum: 0, description: 'Mostrar stock menor o igual a esto (por defecto 5)' } }),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), max = a.maximo ?? 5;
+      const rows = (await ml.stockListings(conn)).filter(r => !r.paused && r.qty != null && r.qty <= max).sort((x, y) => x.qty - y.qty);
+      return { cuenta: conn.nombre, maximo: max, cantidad: rows.length, publicaciones: rows.slice(0, 200).map(r => ({ publicacion: r.ref.split(':')[0], variacion_id: r.ref.split(':')[1] || null, titulo: r.title, stock: r.qty, sku: r.sku, full: r.full })) };
+    } },
+
+  { name: 'ver_preguntas', title: 'Ver preguntas', description: 'Preguntas de compradores (por defecto, las sin responder).', annotations: RO,
+    inputSchema: S({ ...P_CUENTA, estado: { type: 'string', enum: ['sin_responder', 'respondidas', 'todas'] }, limite: { type: 'integer', minimum: 1, maximum: 50 } }),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta);
+      const st = { sin_responder: '&status=UNANSWERED', respondidas: '&status=ANSWERED', todas: '' }[a.estado || 'sin_responder'];
+      const r = await ml.raw(conn, `/questions/search?seller_id=${uid(conn)}${st}&api_version=4&sort_fields=date_created&sort_types=DESC&limit=${a.limite || 30}`);
+      const qs = r?.questions || [];
+      const its = await items(conn, [...new Set(qs.map(q => q.item_id))]).catch(() => []);
+      const tit = Object.fromEntries(its.map(i => [i.id, i.title]));
+      return { cuenta: conn.nombre, total: r?.total ?? qs.length, preguntas: qs.map(q => ({ fecha: q.date_created, publicacion: q.item_id, titulo: tit[q.item_id] || '', pregunta: q.text, estado: q.status === 'UNANSWERED' ? 'sin responder' : 'respondida', respuesta: q.answer?.text || null })) };
+    } },
+
+  { name: 'ver_campanas', title: 'Ver campañas de publicidad', description: 'Campañas de Mercado Ads con presupuesto, ACOS objetivo, gasto, ventas, clics y ACOS en el período (por defecto, últimos 7 días).', annotations: RO,
+    inputSchema: S({ ...P_CUENTA, desde: { type: 'string' }, hasta: { type: 'string' } }),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), hasta = normDay(a.hasta, dayCL()), desde = normDay(a.desde, addDays(hasta, -6));
+      return { cuenta: conn.nombre, desde, hasta, campanas: (await campanas(conn, desde, hasta)).map(resumenCamp) };
+    } },
+
+  { name: 'revisar_alertas', title: 'Revisar alertas de publicidad', description: `Revisa los últimos días (por defecto 3) y avisa de campañas que gastaron más de ${clp(ALERTA_GASTO)} en un día sin ventas.`, annotations: RO,
+    inputSchema: S({ ...P_CUENTA, dias: { type: 'integer', minimum: 1, maximum: 14 } }),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), n = a.dias || 3, alertas = [];
+      for (let i = 1; i <= n; i++) {
+        const dia = addDays(dayCL(), -i);
+        for (const c of (await campanas(conn, dia, dia)).map(resumenCamp)) if (c.gasto > ALERTA_GASTO && c.ventas_unidades === 0) alertas.push({ dia, campana: c.nombre, id: c.id, gasto: c.gasto, ventas: 0, estado: c.estado });
+      }
+      return { cuenta: conn.nombre, regla: `gasto mayor a ${clp(ALERTA_GASTO)} en un día y 0 ventas`, alertas, mensaje: alertas.length ? `${alertas.length} alerta(s)` : 'Sin alertas ✅' };
+    } },
+
+  // ---- cambios (solo proponen) ----
+  { name: 'cambiar_precio', title: 'Proponer cambio de precio', description: 'Propone un precio nuevo para una publicación (todas sus variaciones). Regla: nunca baja más de 15% de una vez.' + NOTA_PROP, annotations: PROP,
+    inputSchema: S({ ...P_CUENTA, ...P_PUB, precio: { type: 'number', description: 'Precio nuevo en pesos chilenos' } }, ['publicacion', 'precio']),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), it = await item(conn, a.publicacion), nuevo = Math.round(a.precio);
+      testGuard('precio', it.id);
+      const vars = it.variations || [];
+      const antesMin = vars.length ? Math.min(...vars.map(v => v.price)) : it.price;
+      precioGuard(antesMin, nuevo);
+      const antes = vars.length ? { variaciones: vars.map(v => ({ variacion_id: v.id, nombre: varName(v), precio: v.price })) } : { precio: it.price };
+      const despues = vars.length ? { variaciones: vars.map(v => ({ variacion_id: v.id, nombre: varName(v), precio: nuevo })) } : { precio: nuevo };
+      const pct = antesMin ? Math.round((nuevo - antesMin) / antesMin * 1000) / 10 : 0;
+      const r = proponer(u, conn, 'precio', it.id, antes, despues, `Precio de ${it.id} "${it.title}": ${clp(antesMin)} → ${clp(nuevo)} (${pct > 0 ? '+' : ''}${pct}%)`);
+      if (it.original_price) r.aviso = `Esta publicación tiene una promoción activa (precio original ${clp(it.original_price)}). Mercado Libre podría rechazar el cambio o terminar la promoción.`;
+      return r;
+    } },
+
+  { name: 'cambiar_stock', title: 'Proponer cambio de stock', description: 'Propone una cantidad nueva de stock. Si la publicación tiene variaciones, indica variacion_id (lo entrega ver_publicacion).' + NOTA_PROP, annotations: PROP,
+    inputSchema: S({ ...P_CUENTA, ...P_PUB, stock: { type: 'integer', minimum: 0 }, variacion_id: { type: 'string' } }, ['publicacion', 'stock']),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), it = await item(conn, a.publicacion);
+      testGuard('stock', it.id);
+      if (isFull(it)) throw uerr('Esta publicación está en Full: el stock lo maneja Mercado Libre.');
+      const vars = it.variations || [];
+      let antes, despues, nombre = '';
+      if (vars.length) {
+        if (!a.variacion_id) throw uerr('Esta publicación tiene variaciones. Indica variacion_id: ' + vars.map(v => `${v.id} = ${varName(v)} (stock ${v.available_quantity})`).join(' · '));
+        const v = vars.find(x => String(x.id) === String(a.variacion_id)); if (!v) throw uerr('Esa variación no existe en la publicación.');
+        nombre = ' · ' + varName(v); antes = { variacion_id: v.id, stock: v.available_quantity }; despues = { variacion_id: v.id, stock: a.stock };
+      } else { antes = { stock: it.available_quantity }; despues = { stock: a.stock }; }
+      return proponer(u, conn, 'stock', it.id, antes, despues, `Stock de ${it.id} "${it.title}${nombre}": ${antes.stock} → ${despues.stock}`);
+    } },
+
+  { name: 'cambiar_titulo', title: 'Proponer cambio de título', description: 'Propone un título nuevo (máx. 60 caracteres). Mercado Libre puede no permitirlo si la publicación ya tiene ventas.' + NOTA_PROP, annotations: PROP,
+    inputSchema: S({ ...P_CUENTA, ...P_PUB, titulo: { type: 'string', maxLength: 60 } }, ['publicacion', 'titulo']),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), it = await item(conn, a.publicacion), t = String(a.titulo).trim();
+      testGuard('titulo', it.id);
+      if (!t || t.length > 60) throw uerr('El título debe tener entre 1 y 60 caracteres.');
+      const r = proponer(u, conn, 'titulo', it.id, { titulo: it.title }, { titulo: t }, `Título de ${it.id}: "${it.title}" → "${t}"`);
+      if (it.sold_quantity > 0) r.aviso = 'Esta publicación ya tiene ventas: Mercado Libre podría no permitir cambiar el título.';
+      return r;
+    } },
+
+  { name: 'cambiar_descripcion', title: 'Proponer cambio de descripción', description: 'Propone una descripción nueva (texto plano, sin HTML ni links).' + NOTA_PROP, annotations: PROP,
+    inputSchema: S({ ...P_CUENTA, ...P_PUB, descripcion: { type: 'string', maxLength: 50000 } }, ['publicacion', 'descripcion']),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), it = await item(conn, a.publicacion);
+      testGuard('descripcion', it.id);
+      return proponer(u, conn, 'descripcion', it.id, { descripcion: await descripcion(conn, it.id) }, { descripcion: String(a.descripcion) }, `Descripción de ${it.id} "${it.title}"`);
+    } },
+
+  { name: 'pausar_o_activar', title: 'Proponer pausar o activar', description: 'Propone pausar o activar una publicación.' + NOTA_PROP, annotations: PROP,
+    inputSchema: S({ ...P_CUENTA, ...P_PUB, accion: { type: 'string', enum: ['pausar', 'activar'] } }, ['publicacion', 'accion']),
+    run: async (u, a) => {
+      const conn = cuenta(u, a.cuenta), it = await item(conn, a.publicacion);
+      testGuard('estado', it.id);
+      const antes = it.status === 'active' ? 'activa' : it.status === 'paused' ? 'pausada' : it.status, despues = a.accion === 'pausar' ? 'pausada' : 'activa';
+      if (antes === despues) throw uerr(`La publicación ya está ${antes}.`);
+      return proponer(u, conn, 'estado', it.id, { estado: antes }, { estado: despues }, `${it.id} "${it.title}": ${antes} → ${despues}`);
+    } },
+
+  { name: 'ajustar_campana', title: 'Proponer ajuste de campaña', description: 'Propone cambiar el presupuesto diario, el ACOS objetivo o el estado (activa/pausada) de una campaña de Mercado Ads.' + NOTA_PROP, annotations: PROP,
+    inputSchema: S({ ...P_CUENTA, campana: { type: 'string', description: 'ID de la campaña (lo entrega ver_campanas)' }, presupuesto_diario: { type: 'number', minimum: 1 }, acos_objetivo: { type: 'number', minimum: 1, maximum: 500 }, estado: { type: 'string', enum: ['activa', 'pausada'] } }, ['campana']),
+    run: async (u, a) => {
+      testGuard('campana', a.campana);
+      const conn = cuenta(u, a.cuenta), c = resumenCamp(await campana(conn, a.campana));
+      const antes = {}, despues = {}, txt = [];
+      if (a.presupuesto_diario != null) { antes.presupuesto_diario = c.presupuesto_diario; despues.presupuesto_diario = Math.round(a.presupuesto_diario); txt.push(`presupuesto ${clp(c.presupuesto_diario)} → ${clp(despues.presupuesto_diario)}`); }
+      if (a.acos_objetivo != null) { antes.acos_objetivo = c.acos_objetivo; despues.acos_objetivo = a.acos_objetivo; txt.push(`ACOS objetivo ${c.acos_objetivo ?? '—'}% → ${a.acos_objetivo}%`); }
+      if (a.estado != null) { if (a.estado === c.estado) throw uerr(`La campaña ya está ${c.estado}.`); antes.estado = c.estado; despues.estado = a.estado; txt.push(`${c.estado} → ${a.estado}`); }
+      if (!txt.length) throw uerr('Indica qué cambiar: presupuesto_diario, acos_objetivo o estado.');
+      return proponer(u, conn, 'campana', String(c.id), antes, despues, `Campaña "${c.nombre}": ${txt.join(', ')}`);
+    } },
+
+  { name: 'modo_prueba', title: 'Modo prueba', description: 'Ver, elegir la publicación de prueba o terminar el modo prueba. Mientras está activo, solo se puede cambiar UNA publicación y no se pueden ajustar campañas. Elegir y terminar crean una propuesta que el usuario debe aprobar.', annotations: PROP,
+    inputSchema: S({ accion: { type: 'string', enum: ['ver', 'elegir', 'terminar', 'volver_a_activar'] }, ...P_CUENTA, publicacion: { type: 'string' } }, ['accion']),
+    run: async (u, a) => {
+      const mp = prueba();
+      if (a.accion === 'ver') return { modo_prueba: mp };
+      if (a.accion === 'elegir') {
+        if (!a.publicacion) throw uerr('Indica el ID de la publicación de prueba.');
+        const conn = cuenta(u, a.cuenta), it = await item(conn, a.publicacion);
+        return proponer(u, conn, 'modo_prueba', 'config', mp, { activo: true, publicacion: it.id }, `Modo prueba: usar solo la publicación ${it.id} "${it.title}"`);
+      }
+      if (a.accion === 'terminar') return proponer(u, null, 'modo_prueba', 'config', mp, { activo: false, publicacion: null }, 'Terminar modo prueba: el ayudante podrá cambiar cualquier publicación y campaña de tus cuentas (siempre con tu confirmación)');
+      return proponer(u, null, 'modo_prueba', 'config', mp, { activo: true, publicacion: mp.publicacion }, 'Volver a activar el modo prueba');
+    } },
+
+  // ---- confirmar / registro / deshacer ----
+  { name: 'confirmar_cambio', title: 'Confirmar y aplicar un cambio', description: 'APLICA en Mercado Libre un cambio propuesto. Úsala SOLO después de mostrarle al usuario el antes y el después y de que él responda explícitamente que sí en un mensaje nuevo. Nunca la llames en el mismo turno en que creaste la propuesta.',
+    annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+    inputSchema: S({ codigo: { type: 'string', description: 'Código de la propuesta, ej. C-1A2B3C' }, respuesta_del_usuario: { type: 'string', description: 'Lo que el usuario escribió para confirmar, textual' } }, ['codigo', 'respuesta_del_usuario']),
+    run: async (u, a) => {
+      const p = db.prepare('SELECT * FROM ayudante_propuestas WHERE codigo=? AND user_id=?').get(String(a.codigo).trim().toUpperCase(), u.id);
+      if (!p) throw uerr('No existe esa propuesta (o ya se usó).');
+      if (p.expires_at < now()) { db.prepare('DELETE FROM ayudante_propuestas WHERE codigo=?').run(p.codigo); throw uerr('La propuesta venció. Pide una nueva.'); }
+      db.prepare('DELETE FROM ayudante_propuestas WHERE codigo=?').run(p.codigo); // un solo uso
+      testGuard(p.tipo, p.objetivo);
+      const conn = p.conn_id ? cuenta(u, String(p.conn_id)) : null;
+      const ins = db.prepare('INSERT INTO ayudante_cambios (user_email,conn_id,cuenta,tipo,objetivo,antes,despues,resumen,estado,error,deshace) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
+      try {
+        await aplicar(conn, p);
+      } catch (e) {
+        ins.run(u.email, p.conn_id, conn?.nombre || null, p.tipo, p.objetivo, p.antes, p.despues, p.resumen, 'error', String(e.message).slice(0, 500), p.deshace);
+        throw uerr('Mercado Libre NO aplicó el cambio: ' + String(e.message).slice(0, 300));
+      }
+      const r = ins.run(u.email, p.conn_id, conn?.nombre || null, p.tipo, p.objetivo, p.antes, p.despues, p.resumen, 'aplicado', null, p.deshace);
+      if (p.deshace) db.prepare("UPDATE ayudante_cambios SET estado='deshecho', deshecho_por=? WHERE id=?").run(Number(r.lastInsertRowid), p.deshace);
+      return { listo: true, registro: Number(r.lastInsertRowid), cambio: p.resumen, mensaje: `✅ Aplicado. Queda en el registro N° ${r.lastInsertRowid}; se puede deshacer con deshacer_cambio.` };
+    } },
+
+  { name: 'cancelar_cambio', title: 'Cancelar una propuesta', description: 'Descarta una propuesta sin aplicarla.', annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+    inputSchema: S({ codigo: { type: 'string' } }, ['codigo']),
+    run: async (u, a) => { const r = db.prepare('DELETE FROM ayudante_propuestas WHERE codigo=? AND user_id=?').run(String(a.codigo).trim().toUpperCase(), u.id); return { cancelada: r.changes > 0 }; } },
+
+  { name: 'ver_registro', title: 'Ver registro de cambios', description: 'Últimos cambios hechos por el ayudante, con antes, después y estado (aplicado, error, deshecho).', annotations: RO,
+    inputSchema: S({ limite: { type: 'integer', minimum: 1, maximum: 100 } }),
+    run: async (u, a) => ({ cambios: db.prepare('SELECT * FROM ayudante_cambios ORDER BY id DESC LIMIT ?').all(a.limite || 20).map(c => ({ registro: c.id, fecha: c.at + ' UTC', por: c.user_email, cuenta: c.cuenta, cambio: c.resumen, estado: c.estado, error: c.error || undefined, antes: JSON.parse(c.antes || 'null'), despues: JSON.parse(c.despues || 'null'), deshace_al: c.deshace || undefined, deshecho_por: c.deshecho_por || undefined })) }) },
+
+  { name: 'deshacer_cambio', title: 'Proponer deshacer un cambio', description: 'Propone volver al valor anterior de un cambio del registro. Se aplica con confirmar_cambio, igual que cualquier cambio.' + NOTA_PROP, annotations: PROP,
+    inputSchema: S({ registro: { type: 'integer', description: 'N° de registro (de ver_registro)' } }, ['registro']),
+    run: async (u, a) => {
+      const c = db.prepare('SELECT * FROM ayudante_cambios WHERE id=?').get(a.registro);
+      if (!c) throw uerr('No existe ese registro.');
+      if (c.estado !== 'aplicado') throw uerr(`Ese cambio no se puede deshacer (estado: ${c.estado}).`);
+      const conn = c.conn_id ? cuenta(u, String(c.conn_id)) : null;
+      const antes = JSON.parse(c.despues), despues = JSON.parse(c.antes);
+      if (c.tipo === 'precio') {
+        const min = o => o.variaciones ? Math.min(...o.variaciones.map(v => v.precio)) : o.precio;
+        precioGuard(min(antes), min(despues));
+      }
+      return proponer(u, conn, c.tipo, c.objetivo, antes, despues, `DESHACER registro N° ${c.id}: ${c.resumen}`, c.id);
+    } },
+];
+
+// ---------- MCP (JSON-RPC sobre HTTP, sin estado) ----------
+const INSTRUCCIONES = `Ayudante de Mercado Libre de Javi (EtiquetaHub). Responde siempre en español simple.
+Reglas: 1) Las herramientas cambiar_*, pausar_o_activar, ajustar_campana, deshacer_cambio y modo_prueba SOLO proponen. Muestra siempre el ANTES y el DESPUÉS y pregunta "¿Confirmas?". 2) Llama a confirmar_cambio solo cuando el usuario diga que sí en un mensaje nuevo; nunca por tu cuenta. 3) Nunca intentes bajar un precio más de 15% de una vez ni encadenar bajas para saltarte la regla. 4) Montos en pesos chilenos.`;
+
+function rpcResult(id, result) { return { jsonrpc: '2.0', id, result }; }
+function rpcError(id, code, message) { return { jsonrpc: '2.0', id, error: { code, message } }; }
+
+async function rpc(user, msg) {
+  const { id, method, params = {} } = msg || {};
+  if (id === undefined || id === null) return null; // notificación: sin respuesta
+  switch (method) {
+    case 'initialize': {
+      const v = VERSIONES.includes(params.protocolVersion) ? params.protocolVersion : VERSIONES[0];
+      return rpcResult(id, { protocolVersion: v, capabilities: { tools: { listChanged: false } }, serverInfo: { name: 'ayudante-mercadolibre', title: 'Ayudante Mercado Libre (EtiquetaHub)', version: '1.0.0' }, instructions: INSTRUCCIONES });
+    }
+    case 'ping': return rpcResult(id, {});
+    case 'tools/list': return rpcResult(id, { tools: TOOLS.map(({ run, ...t }) => t) });
+    case 'tools/call': {
+      const t = TOOLS.find(x => x.name === params.name);
+      if (!t) return rpcError(id, -32602, 'Herramienta desconocida: ' + params.name);
+      try {
+        const out = await t.run(user, params.arguments || {});
+        return rpcResult(id, { content: [{ type: 'text', text: JSON.stringify(out, null, 1) }], isError: false });
+      } catch (e) {
+        if (!e.user) console.warn('[ayudante]', params.name, e.message);
+        return rpcResult(id, { content: [{ type: 'text', text: e.user ? e.message : 'Error: ' + String(e.message).slice(0, 400) }], isError: true });
+      }
+    }
+    case 'resources/list': return rpcResult(id, { resources: [] });
+    case 'prompts/list': return rpcResult(id, { prompts: [] });
+    default: return rpcError(id, -32601, 'Método no soportado: ' + method);
+  }
+}
+
+// ---------- OAuth 2.1 (para agregar el conector en Claude) ----------
+const codes = new Map(); // código de autorización -> datos (10 minutos)
+const originOf = req => `${String(req.headers['x-forwarded-proto'] || 'https').split(',')[0]}://${req.headers['x-forwarded-host'] || req.headers.host}`;
+const okRedirect = u => { try { const x = new URL(u); return x.protocol === 'https:' && /(^|\.)claude\.(ai|com)$/.test(x.hostname); } catch { return false; } };
+// client_id sin estado, firmado: guarda las direcciones de vuelta permitidas
+function makeClient(redirects) { const d = Buffer.from(JSON.stringify({ r: redirects, t: now() })).toString('base64url'); return d + '.' + sec.sign('mcpc:' + d); }
+function readClient(cid) {
+  const [d, s] = String(cid || '').split('.');
+  if (!d || s !== sec.sign('mcpc:' + d)) return null;
+  try { return JSON.parse(Buffer.from(d, 'base64url').toString()); } catch { return null; }
+}
+const clientSecret = cid => sec.sign('mcps:' + cid);
+
+function issueTokens(user, clientId) {
+  const access = 'eha_' + crypto.randomBytes(32).toString('base64url'), refresh = 'ehr_' + crypto.randomBytes(32).toString('base64url');
+  const ins = db.prepare('INSERT INTO ayudante_tokens (hash,kind,user_id,client_id,pw,expires_at) VALUES (?,?,?,?,?,?)');
+  ins.run(h256(access), 'access', user.id, clientId, pwFp(user), now() + ACCESS_DAYS * 864e5);
+  ins.run(h256(refresh), 'refresh', user.id, clientId, pwFp(user), now() + REFRESH_DAYS * 864e5);
+  db.prepare('DELETE FROM ayudante_tokens WHERE expires_at < ?').run(now());
+  return { access_token: access, token_type: 'Bearer', expires_in: ACCESS_DAYS * 86400, refresh_token: refresh, scope: 'mercadolibre' };
+}
+// usuario válido: dueño de la app (superadmin), nunca fulfillment; si cambió su contraseña, el token deja de servir
+function tokenUser(tok, kind = 'access') {
+  const r = tok && db.prepare('SELECT * FROM ayudante_tokens WHERE hash=? AND kind=?').get(h256(tok), kind);
+  if (!r || r.expires_at < now()) return null;
+  const u = userById(r.user_id);
+  if (!u || !u.superadmin || u.role === 'fulfillment' || pwFp(u) !== r.pw) return null;
+  return { u, row: r };
+}
+
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+function loginPage(params, error = '') {
+  const hidden = Object.entries(params).map(([k, v]) => `<input type="hidden" name="${esc(k)}" value="${esc(v)}">`).join('');
+  return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Conectar ayudante · EtiquetaHub</title>
+<style>body{font-family:system-ui,sans-serif;background:#f4f5f7;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center;color:#1f2937}
+form{background:#fff;padding:28px;border-radius:14px;box-shadow:0 4px 24px #0001;width:min(360px,92vw)}h1{font-size:20px;margin:0 0 6px}p{color:#555;font-size:14px;margin:0 0 18px}
+label{font-size:13px;font-weight:600}input[type=email],input[type=password]{width:100%;box-sizing:border-box;padding:11px;margin:6px 0 14px;border:1px solid #ccc;border-radius:8px;font-size:16px}
+button{width:100%;padding:12px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:16px;font-weight:600}.e{background:#fee2e2;color:#991b1b;padding:10px;border-radius:8px;font-size:14px;margin-bottom:14px}</style></head>
+<body><form method="post" action="/oauth/authorize">${hidden}<h1>🤖 Ayudante Mercado Libre</h1><p>Claude quiere conectarse a tu cuenta de Mercado Libre a través de EtiquetaHub. Entra con tu correo y contraseña de dueño de EtiquetaHub.</p>
+${error ? `<div class="e">${esc(error)}</div>` : ''}<label>Correo</label><input type="email" name="email" required autocomplete="username"><label>Contraseña</label><input type="password" name="password" required autocomplete="current-password"><button>Permitir acceso</button></form></body></html>`;
+}
+
+async function readRaw(req, limit = 2e6) {
+  const chunks = []; let n = 0;
+  for await (const c of req) { n += c.length; if (n > limit) throw Object.assign(new Error('Cuerpo muy grande'), { status: 413 }); chunks.push(c); }
+  return Buffer.concat(chunks).toString('utf8');
+}
+async function readForm(req) {
+  const raw = await readRaw(req);
+  if (/json/.test(req.headers['content-type'] || '')) { try { return JSON.parse(raw || '{}'); } catch { return {}; } }
+  return Object.fromEntries(new URLSearchParams(raw));
+}
+function send(res, status, body, headers = {}) {
+  const isStr = typeof body === 'string';
+  res.writeHead(status, { 'content-type': isStr ? 'text/html; charset=utf-8' : 'application/json; charset=utf-8', 'cache-control': 'no-store', 'access-control-allow-origin': '*', 'access-control-allow-headers': 'authorization, content-type, mcp-protocol-version, mcp-session-id', 'access-control-expose-headers': 'www-authenticate, mcp-session-id', ...headers });
+  res.end(isStr ? body : JSON.stringify(body));
+}
+
+function isMine(p) { return p === '/mcp' || p.startsWith('/mcp/') || p.startsWith('/oauth/') || p.startsWith('/.well-known/oauth-'); }
+
+async function handle(req, res, url) {
+  const p = url.pathname, m = req.method, base = originOf(req);
+  if (m === 'OPTIONS') return send(res, 204, '');
+
+  if (p.startsWith('/.well-known/oauth-protected-resource')) return send(res, 200, { resource: `${base}/mcp`, authorization_servers: [base], bearer_methods_supported: ['header'], scopes_supported: ['mercadolibre'], resource_name: 'Ayudante Mercado Libre (EtiquetaHub)' });
+  if (p.startsWith('/.well-known/oauth-authorization-server')) return send(res, 200, {
+    issuer: base, authorization_endpoint: `${base}/oauth/authorize`, token_endpoint: `${base}/oauth/token`, registration_endpoint: `${base}/oauth/register`,
+    response_types_supported: ['code'], grant_types_supported: ['authorization_code', 'refresh_token'], code_challenge_methods_supported: ['S256'],
+    token_endpoint_auth_methods_supported: ['none', 'client_secret_post', 'client_secret_basic'], scopes_supported: ['mercadolibre'],
+  });
+
+  // Registro dinámico del cliente (Claude lo hace solo)
+  if (p === '/oauth/register' && m === 'POST') {
+    const b = await readForm(req);
+    const redirects = (Array.isArray(b.redirect_uris) ? b.redirect_uris : []).map(String);
+    if (!redirects.length || !redirects.every(okRedirect)) return send(res, 400, { error: 'invalid_redirect_uri', error_description: 'Solo se permite Claude (claude.ai / claude.com).' });
+    const cid = makeClient(redirects), auth = b.token_endpoint_auth_method || 'none';
+    return send(res, 201, { client_id: cid, client_id_issued_at: Math.floor(now() / 1000), redirect_uris: redirects, grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'], token_endpoint_auth_method: auth, client_name: b.client_name || 'Claude', ...(auth !== 'none' ? { client_secret: clientSecret(cid), client_secret_expires_at: 0 } : {}) });
+  }
+
+  if (p === '/oauth/authorize') {
+    const q = m === 'GET' ? Object.fromEntries(url.searchParams) : await readForm(req);
+    const keep = { client_id: q.client_id || '', redirect_uri: q.redirect_uri || '', state: q.state || '', code_challenge: q.code_challenge || '', code_challenge_method: q.code_challenge_method || '', scope: q.scope || '', resource: q.resource || '', response_type: q.response_type || 'code' };
+    const cl = readClient(keep.client_id);
+    if (!cl || !cl.r.includes(keep.redirect_uri) || !okRedirect(keep.redirect_uri)) return send(res, 400, '<p>Solicitud inválida (cliente o dirección de vuelta desconocidos).</p>');
+    if (keep.response_type !== 'code' || !keep.code_challenge || keep.code_challenge_method !== 'S256') return send(res, 400, '<p>Solicitud inválida (falta PKCE S256).</p>');
+    if (m === 'GET') return send(res, 200, loginPage(keep));
+    const key = 'mcp|' + String(q.email || '').trim().toLowerCase() + '|' + (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
+    if (recovery.loginBlocked(key)) return send(res, 429, loginPage(keep, 'Demasiados intentos. Espera 15 minutos.'));
+    const u = db.prepare('SELECT * FROM users WHERE email = ?').get(String(q.email || '').trim());
+    if (!u || !sec.checkPassword(String(q.password || ''), u.pass_hash)) { recovery.loginFailed(key); return send(res, 401, loginPage(keep, 'Correo o contraseña incorrectos.')); }
+    if (!u.superadmin || u.role === 'fulfillment') { recovery.loginFailed(key); return send(res, 403, loginPage(keep, 'Esta cuenta no tiene permiso para usar el ayudante. Solo los dueños de la app.')); }
+    recovery.loginOk(key);
+    const code = crypto.randomBytes(24).toString('base64url');
+    codes.set(code, { user_id: u.id, client_id: keep.client_id, redirect_uri: keep.redirect_uri, challenge: keep.code_challenge, exp: now() + 10 * 60e3 });
+    for (const [k, v] of codes) if (v.exp < now()) codes.delete(k);
+    const back = new URL(keep.redirect_uri); back.searchParams.set('code', code); if (keep.state) back.searchParams.set('state', keep.state);
+    res.writeHead(302, { location: back.toString(), 'cache-control': 'no-store' }); return res.end();
+  }
+
+  if (p === '/oauth/token' && m === 'POST') {
+    const b = await readForm(req);
+    let cid = b.client_id, csec = b.client_secret;
+    const basic = String(req.headers.authorization || '').match(/^Basic\s+(.+)$/i);
+    if (basic) { const [i, s] = Buffer.from(basic[1], 'base64').toString().split(':'); cid = decodeURIComponent(i); csec = decodeURIComponent(s || ''); }
+    if (!readClient(cid)) return send(res, 401, { error: 'invalid_client' });
+    if (csec && csec !== clientSecret(cid)) return send(res, 401, { error: 'invalid_client' });
+    if (b.grant_type === 'authorization_code') {
+      const c = codes.get(b.code); codes.delete(b.code);
+      if (!c || c.exp < now() || c.client_id !== cid || (b.redirect_uri && b.redirect_uri !== c.redirect_uri)) return send(res, 400, { error: 'invalid_grant' });
+      const ch = crypto.createHash('sha256').update(String(b.code_verifier || '')).digest('base64url');
+      if (ch !== c.challenge) return send(res, 400, { error: 'invalid_grant', error_description: 'PKCE' });
+      const u = userById(c.user_id); if (!u) return send(res, 400, { error: 'invalid_grant' });
+      return send(res, 200, issueTokens(u, cid));
+    }
+    if (b.grant_type === 'refresh_token') {
+      const t = tokenUser(b.refresh_token, 'refresh');
+      if (!t || t.row.client_id !== cid) return send(res, 400, { error: 'invalid_grant' });
+      db.prepare('DELETE FROM ayudante_tokens WHERE hash=?').run(h256(b.refresh_token)); // rotación
+      return send(res, 200, issueTokens(t.u, cid));
+    }
+    return send(res, 400, { error: 'unsupported_grant_type' });
+  }
+
+  // ---- el conector ----
+  if (p === '/mcp' || p.startsWith('/mcp/')) {
+    const tok = String(req.headers.authorization || '').match(/^Bearer\s+(.+)$/i)?.[1];
+    const t = tokenUser(tok);
+    if (!t) return send(res, 401, { error: 'invalid_token' }, { 'www-authenticate': `Bearer resource_metadata="${base}/.well-known/oauth-protected-resource/mcp"` });
+    if (m === 'GET') return send(res, 405, { error: 'Usa POST' }, { allow: 'POST' });
+    if (m === 'DELETE') return send(res, 200, { ok: true });
+    if (m !== 'POST') return send(res, 405, { error: 'Método no permitido' });
+    let body; try { body = JSON.parse(await readRaw(req) || 'null'); } catch { return send(res, 400, rpcError(null, -32700, 'JSON inválido')); }
+    if (Array.isArray(body)) {
+      const out = (await Promise.all(body.map(x => rpc(t.u, x)))).filter(Boolean);
+      return out.length ? send(res, 200, out) : send(res, 202, '');
+    }
+    const out = await rpc(t.u, body);
+    return out ? send(res, 200, out) : send(res, 202, '');
+  }
+  return send(res, 404, { error: 'No encontrado' });
+}
+
+module.exports = { handle, isMine, TOOLS, _test: { rpc, startOfDayUTC, addDays, precioGuard, prueba, cfgSet, issueTokens, makeClient } };
 
 };
 
