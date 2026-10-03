@@ -4643,6 +4643,7 @@ const settings = require('./settings');
 const sales = require('./sales');
 
 const IVA = 1.19;
+db.exec(`CREATE TABLE IF NOT EXISTS late_log (order_id INTEGER PRIMARY KEY, seller_id INTEGER NOT NULL, day TEXT NOT NULL, at TEXT NOT NULL DEFAULT (datetime('now')))`);
 const chileDay = d => new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
 const addD = (d, n) => { const x = new Date(d + 'T12:00:00Z'); x.setUTCDate(x.getUTCDate() + n); return x.toISOString().slice(0, 10); };
 const inList = ids => ids.map(() => '?').join(',') || 'NULL';
@@ -6065,7 +6066,7 @@ http.createServer((req, res) => {
   console.log(`EtiquetaHub en ${cfg.baseUrl} (puerto ${cfg.port})${cfg.demo ? ' — MODO DEMO' : ''}`);
   sync.start();
   sales.start();
-  recovery.startKeepAlive();
+  recovery.startKeepAlive(); setTimeout(() => { try { require('./mkp'); } catch (e) { console.warn('[mkp] inicio', e.message); } }, 30e3); // registra atrasos (racha) aunque nadie abra MKP Flash
   // Render gratis se duerme sin visitas: la app se visita sola cada 4 minutos
   if (process.env.RENDER_EXTERNAL_URL) setInterval(() => fetch(`${cfg.internalUrl}/health`).catch(() => {}), 4 * 60e3);
 });
