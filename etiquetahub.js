@@ -4059,10 +4059,18 @@ async function claimReply(user, connId, claimId, text, toMediator) {
   const conn = connFor(user, connId);
   const body = { receiver_role: toMediator ? 'mediator' : 'complainant', message: String(text).slice(0, 2000) };
   let r, err = null;
-  try { r = await ml.apiSend(conn, 'POST', `/post-purchase/v1/claims/${claimId}/actions/send-message`, body); }
-  catch (e) { err = e.message; }
+  // endpoint oficial de Mercado Libre para enviar mensajes en un reclamo: POST /post-purchase/v1/claims/{id}/messages
+  // (el antiguo /actions/send-message respondía OK pero el mensaje no quedaba publicado)
+  let via = 'messages';
+  try { r = await ml.apiSend(conn, 'POST', `/post-purchase/v1/claims/${claimId}/messages`, body); }
+  catch (e) {
+    if (/HTTP (404|405)/.test(e.message)) {
+      via = 'send-message';
+      try { r = await ml.apiSend(conn, 'POST', `/post-purchase/v1/claims/${claimId}/actions/send-message`, body); } catch (e2) { err = e2.message; }
+    } else err = e.message;
+  }
   // diagnóstico: lo último que respondió Mercado Libre (solo lo ve el dueño de la app)
-  lastClaimSend.unshift({ at: new Date().toISOString(), conn: Number(connId), claim: String(claimId), body: { receiver_role: body.receiver_role, len: body.message.length }, resp: r === undefined ? null : r, err });
+  lastClaimSend.unshift({ at: new Date().toISOString(), via, conn: Number(connId), claim: String(claimId), body: { receiver_role: body.receiver_role, len: body.message.length }, resp: r === undefined ? null : r, err });
   lastClaimSend.length = Math.min(lastClaimSend.length, 20);
   if (err) throw Object.assign(new Error(err), { status: 502 });
   bust(connId);
