@@ -4916,6 +4916,25 @@ function lateAlert(x) {
   const warn = x.level === 'warn';
   toUsers(usersForSeller(x.seller_id), { title: warn ? '⏰ Pedido por atrasarse' : '🚨 Pedido atrasado', body: `${x.ship || ''} · Venta #${x.order_number}${x.customer ? ' · ' + x.customer : ''}`, tag: 'late-' + x.id, url: '/?go=mkp&v=late', urgent: true }, `late:${x.level}:${x.id}`).catch(() => {});
 }
+// Un solo aviso por persona con lo nuevo (cada producto avisa máximo una vez al día y otra si se agota)
+async function lowStockDigest(items) {
+  const day = new Date().toISOString().slice(0, 10);
+  const byUser = new Map();
+  for (const it of items) {
+    const k = `stock:${it.key}:${it.qty <= 0 ? 0 : 'low'}:${day}`;
+    if (db.prepare('SELECT 1 FROM push_sent WHERE k=?').get(k)) continue;
+    try { db.prepare('INSERT INTO push_sent (k) VALUES (?)').run(k); } catch { continue; }
+    for (const u of new Set(it.sellers.flatMap(usersForSeller))) (byUser.get(u) || byUser.set(u, []).get(u)).push(it);
+  }
+  for (const [u, list] of byUser) {
+    const outN = list.filter(i => i.qty <= 0).length;
+    const name = i => String(i.name || i.sku).split(' · ')[0].slice(0, 40) + (String(i.name).includes(' · ') ? ' ' + String(i.name).split(' · ').pop().split(' / ').pop() : '');
+    const msg = list.length === 1
+      ? { title: list[0].qty <= 0 ? '📦 Producto sin stock' : '📦 Queda poco stock', body: `${name(list[0])} · quedan ${list[0].qty}${list[0].days != null && list[0].qty > 0 ? ` (≈${list[0].days} día${list[0].days === 1 ? '' : 's'})` : ''}` }
+      : { title: `📦 ${list.length} productos con poco stock`, body: `${outN ? outN + ' sin stock · ' : ''}${list.slice(0, 3).map(name).join(' · ')}${list.length > 3 ? '…' : ''}` };
+    await toUsers([u], { ...msg, tag: 'stock', url: '/?go=mkp&v=lowstock' });
+  }
+}
 function lowStock(sellerIds, it) {
   const users = [...new Set(sellerIds.flatMap(usersForSeller))];
   toUsers(users, { title: '📦 Queda poco stock', body: `${String(it.name || it.sku).slice(0, 80)} · quedan ${it.qty}${it.days != null ? ` (≈${it.days} día${it.days === 1 ? '' : 's'})` : ''}`, tag: 'stock-' + it.sku, url: '/?go=mkp&v=lowstock' }, `stock:${it.key}:${it.qty <= 0 ? 0 : 'low'}:${new Date().toISOString().slice(0, 10)}`).catch(() => {});
@@ -4934,7 +4953,7 @@ async function test(user) { return toUsers([user.id], { title: '🔔 Avisos acti
 // limpieza de marcas antiguas
 setInterval(() => { try { db.prepare("DELETE FROM push_sent WHERE at < datetime('now','-10 days')").run(); } catch {} }, 6 * 3600e3).unref?.();
 
-module.exports = { publicKey, subscribe, unsubscribe, count, test, toUsers, usersForSeller, newSale, newQuestion, lateAlert, lowStock, _encrypt: encrypt };
+module.exports = { publicKey, subscribe, unsubscribe, count, test, toUsers, usersForSeller, newSale, newQuestion, lateAlert, lowStock, lowStockDigest, _encrypt: encrypt };
 
 };
 
@@ -4965,6 +4984,11 @@ function compute(spaceId, onlySellers) {
     if (s.sku) (bySku.get(s.sku) || bySku.set(s.sku, []).get(s.sku)).push(s);
     if (s.pid) (byPid.get(s.pid) || byPid.set(s.pid, []).get(s.pid)).push(s);
   }
+  // ventas de una publicación, solo de la variante (talla/color) que dice el título "… · Negro / Lisa / XL"
+  const variantSales = (pid, title) => {
+    const vals = String(title || '').includes(' · ') ? String(title).split(' · ').pop().split(' / ').map(x => x.trim().toLowerCase()).filter(x => x && x !== '...' && x !== 'ninguno') : [];
+    return (byPid.get(norm(pid)) || []).filter(s => vals.every(x => s.variant.toLowerCase().includes(x)));
+  };
   const rate = list => { const u30 = list.reduce((a, s) => a + (s.qty || 1), 0), u14 = list.filter(s => s.day >= since14).reduce((a, s) => a + (s.qty || 1), 0); return { u30, perDay: u14 / 14 }; };
   const min = minOf(spaceId);
   const out = [];
@@ -4979,10 +5003,12 @@ function compute(spaceId, onlySellers) {
   for (const it of v.items) {
     const nonFull = it.links.filter(l => !l.full && l.mk_qty != null);
     const unified = activeBodega.has(it.bodega_id) && it.qty != null;
-    const qty = unified ? it.qty : nonFull.length ? Math.min(...nonFull.map(l => l.mk_qty)) : null;
+    // varias publicaciones del mismo SKU en la misma cuenta: vale la que tiene más stock; entre cuentas/marketplaces, la menor
+    const perConn = new Map(); for (const l of nonFull) perConn.set(l.conn, Math.max(perConn.get(l.conn) ?? -Infinity, l.mk_qty));
+    const qty = unified ? it.qty : perConn.size ? Math.min(...perConn.values()) : null;
     const k = norm(it.sku);
     let list = bySku.get(k) || [];
-    if (!list.length) for (const l of it.links) list = list.concat(byPid.get(norm(String(l.ref).split(':')[0])) || []);
+    if (!list.length) { const seenRef = new Set(); for (const l of it.links) { const [pid] = String(l.ref).split(':'); if (seenRef.has(pid)) continue; seenRef.add(pid); list = list.concat(variantSales(pid, l.title)); } }
     const sellers = [...new Set(it.links.map(l => l.seller_id))];
     push({ key: `${it.bodega_id}:${it.owner}:${k}`, sku: it.sku, name: it.name, qty, source: unified ? 'bodega' : 'mk', sellers, seller: sellers.map(id => sellerName.get(id)).filter(Boolean).join(', '), links: it.links.map(l => ({ mk: l.mk, account: l.account, qty: l.mk_qty, full: l.full })), sold: rate(list) });
   }
@@ -4992,8 +5018,7 @@ function compute(spaceId, onlySellers) {
   for (const l of noSku) {
     const cn = conns.get(l.connection_id); if (!cn) continue;
     const [pid] = String(l.ref).split(':');
-    const vals = String(l.title || '').includes(' · ') ? String(l.title).split(' · ').pop().split(' / ').map(x => x.trim().toLowerCase()).filter(Boolean) : [];
-    const list = (byPid.get(norm(pid)) || []).filter(s => vals.every(x => s.variant.toLowerCase().includes(x)));
+    const list = variantSales(pid, l.title);
     push({ key: `ref:${l.connection_id}:${l.ref}`, sku: pid, name: l.title, qty: l.mk_qty, source: 'mk', sellers: [cn.seller_id], seller: sellerName.get(cn.seller_id) || '', links: [{ mk: cn.marketplace, account: cn.account_label || '', qty: l.mk_qty, full: false }], sold: rate(list) });
   }
   out.sort((a, b) => ((b.qty <= 0) - (a.qty <= 0)) || ((a.days ?? 999) - (b.days ?? 999)) || (a.qty - b.qty));
@@ -5009,7 +5034,7 @@ async function tick() {
   const spacesWith = db.prepare("SELECT DISTINCT s.space_id id FROM connections c JOIN sellers s ON s.id=c.seller_id WHERE c.marketplace <> 'demo'").all();
   for (const sp of spacesWith) {
     try { await stock.importListings(sp.id); cache.clear(); } catch (e) { console.warn('[poco stock] lectura', sp.id, e.message); }
-    try { for (const it of compute(sp.id, null).items) push.lowStock(it.sellers, it); } catch (e) { console.warn('[poco stock]', sp.id, e.message); }
+    try { await push.lowStockDigest(compute(sp.id, null).items); } catch (e) { console.warn('[poco stock]', sp.id, e.message); }
   }
 }
 function start() { setTimeout(function run() { tick().catch(() => {}).finally(() => setTimeout(run, 60 * 60e3)); }, 3 * 60e3); }
