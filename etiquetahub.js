@@ -1988,10 +1988,9 @@ const CATALOG = {
   wc: { name: 'WooCommerce', short: 'Woo', color: '#7F54B3', icon: '🟣', kind: 'store', fee: 3.5, label: 'own', cutoff: 'Según las horas de despacho que configures' },
   js: { name: 'Jumpseller', short: 'Jumpseller', color: '#E4572E', icon: '🟠', kind: 'store', fee: 3.5, label: 'own', cutoff: 'Según las horas de despacho que configures' },
   // en preparación: sus APIs piden acceso de integrador o credenciales que se entregan a cada vendedor
-  // BETA: armados según la documentación pública; se confirman con la primera cuenta real
-  rp: { name: 'Ripley', short: 'Ripley', color: '#5B2C83', icon: '🟪', kind: 'marketplace', fee: 15, label: 'marketplace', beta: true, cutoff: 'Plazo de despacho que informa Ripley' },
-  wm: { name: 'Walmart / Lider', short: 'Lider', color: '#0071CE', icon: '🔵', kind: 'marketplace', fee: 15, label: 'own', beta: true, cutoff: 'Fecha estimada de despacho que informa Walmart' },
-  so: { name: 'Sodimac', short: 'Sodimac', color: '#D7282F', icon: '🔴', kind: 'marketplace', fee: 15, label: 'marketplace', beta: true, cutoff: 'Fin del día de su plazo (Seller Center de Falabella)' },
+  rp: { name: 'Ripley', short: 'Ripley', color: '#5B2C83', icon: '🟪', kind: 'marketplace', fee: 15, label: 'marketplace', cutoff: 'Plazo de despacho que informa Ripley' },
+  wm: { name: 'Walmart / Lider', short: 'Lider', color: '#0071CE', icon: '🔵', kind: 'marketplace', fee: 15, label: 'own', cutoff: 'Fecha estimada de despacho que informa Walmart' },
+  so: { name: 'Sodimac', short: 'Sodimac', color: '#D7282F', icon: '🔴', kind: 'marketplace', fee: 15, label: 'marketplace', cutoff: 'Fin del día de su plazo (Seller Center de Falabella)' },
   dr: { name: 'Dropi', short: 'Dropi', color: '#1F2937', icon: '⚫', kind: 'marketplace', fee: 0, label: 'marketplace', soon: 'Dropi entrega su API solo a integradores: hay que pedir acceso.' },
 };
 const ACTIVE = Object.keys(CATALOG).filter(k => !CATALOG[k].soon);
@@ -2266,7 +2265,19 @@ const store = require('./store');
 // Regiones de Chile tal como las guarda WooCommerce (CL-RM, CL-VS…)
 const REG = { 'CL-AI': 'Aysén', 'CL-AN': 'Antofagasta', 'CL-AP': 'Arica y Parinacota', 'CL-AR': 'Araucanía', 'CL-AT': 'Atacama', 'CL-BI': 'Biobío', 'CL-CO': 'Coquimbo', 'CL-LI': "O'Higgins", 'CL-LL': 'Los Lagos', 'CL-LR': 'Los Ríos', 'CL-MA': 'Magallanes', 'CL-ML': 'Maule', 'CL-NB': 'Ñuble', 'CL-RM': 'Región Metropolitana', 'CL-TA': 'Tarapacá', 'CL-VS': 'Valparaíso' };
 const site = c => String(c.url || '').trim().replace(/\/+$/, '').replace(/^(?!https?:\/\/)/, 'https://');
-const api = (conn, path, opts = {}) => request(`${site(conn.creds)}/wp-json/wc/v3${path}`, { ...opts, headers: { authorization: 'Basic ' + Buffer.from(`${conn.creds.key}:${conn.creds.secret}`).toString('base64'), 'content-type': 'application/json' } }, opts.method ? { retries: 0 } : undefined);
+// Algunos hostings (Apache/CGI) borran el encabezado Authorization y WooCommerce responde 401 aunque las claves estén bien.
+// En ese caso WooCommerce acepta las claves como parámetros (solo por https), que es su método oficial alternativo.
+async function api(conn, path, opts = {}) {
+  const url = `${site(conn.creds)}/wp-json/wc/v3${path}`, o2 = opts.method ? { retries: 0 } : undefined;
+  if (!conn.creds.qsAuth) {
+    try { return await request(url, { ...opts, headers: { authorization: 'Basic ' + Buffer.from(`${conn.creds.key}:${conn.creds.secret}`).toString('base64'), 'content-type': 'application/json' } }, o2); } catch (e) {
+      if (e.status !== 401 || !/^https:/.test(url)) throw e;
+    }
+  }
+  const r = await request(`${url}${url.includes('?') ? '&' : '?'}consumer_key=${encodeURIComponent(conn.creds.key)}&consumer_secret=${encodeURIComponent(conn.creds.secret)}`, { ...opts, headers: { 'content-type': 'application/json' } }, o2);
+  if (!conn.creds.qsAuth && conn.saveCreds) conn.saveCreds({ ...conn.creds, qsAuth: true }); // se recuerda para no probar dos veces
+  return r;
+}
 
 async function test(conn) {
   if (!/^ck_/.test(conn.creds.key || '') || !/^cs_/.test(conn.creds.secret || '')) throw new Error('La clave empieza con ck_ y el secreto con cs_');
@@ -2381,7 +2392,19 @@ const { request } = require('../http');
 const store = require('./store');
 
 const API = () => process.env.JUMPSELLER_API || 'https://api.jumpseller.com/v1';
-const api = (conn, path, opts = {}) => request(`${API()}${path}${path.includes('?') ? '&' : '?'}login=${encodeURIComponent(conn.creds.login)}&authtoken=${encodeURIComponent(conn.creds.authtoken)}`, { ...opts, headers: { 'content-type': 'application/json' } }, opts.method ? { retries: 0 } : undefined);
+// Método que documenta Jumpseller hoy: Basic auth con Login y Token. Si una cuenta antigua no lo acepta, se usa el método
+// anterior (login y authtoken en la dirección).
+async function api(conn, path, opts = {}) {
+  const o2 = opts.method ? { retries: 0 } : undefined, c = conn.creds;
+  if (!c.qsAuth) {
+    try { return await request(`${API()}${path}`, { ...opts, headers: { authorization: 'Basic ' + Buffer.from(`${c.login}:${c.authtoken}`).toString('base64'), 'content-type': 'application/json' } }, o2); } catch (e) {
+      if (e.status !== 401 && e.status !== 403) throw e;
+    }
+  }
+  const r = await request(`${API()}${path}${path.includes('?') ? '&' : '?'}login=${encodeURIComponent(c.login)}&authtoken=${encodeURIComponent(c.authtoken)}`, { ...opts, headers: { 'content-type': 'application/json' } }, o2);
+  if (!c.qsAuth && conn.saveCreds) conn.saveCreds({ ...c, qsAuth: true });
+  return r;
+}
 
 async function test(conn) {
   const r = await api(conn, '/store/info.json').catch(async () => { await api(conn, '/orders.json?limit=1'); return null; });
@@ -2482,7 +2505,6 @@ module.exports = { stockListings, setStock, returns, test, listShipments, refres
 __defs["connectors/ripley"] = function (module, exports, require, __dirname) {
 // Ripley (Mercado Ripley) — plataforma Mirakl. El vendedor pega su API Key de Mirakl
 // (ripley-prod.mirakl.net › icono de usuario › Perfil › Clave de API).
-// BETA: armado según la API pública de Mirakl; se confirma con la primera cuenta real.
 // Etiqueta: se busca entre los documentos del pedido en Mirakl; si Ripley no la publica ahí, EtiquetaHub genera la suya.
 const cfg = require('../config');
 const { request, isPdf } = require('../http');
@@ -2586,14 +2608,13 @@ async function setStock(conn, ref, qty) {
   await api(conn, '/offers', { method: 'POST', body: JSON.stringify({ offers: [{ shop_sku: o.shop_sku, product_id: o.product_sku, product_id_type: 'SKU', price: store.num(o.price), state_code: o.state_code || '11', quantity: Math.max(0, qty), update_delete: 'update' }] }) });
 }
 
-module.exports = { test, listShipments, refresh, fetchLabel, sales, listings, stockListings, setStock, raw: api, toShipment, beta: true };
+module.exports = { test, listShipments, refresh, fetchLabel, sales, listings, stockListings, setStock, raw: api, toShipment };
 
 };
 
 __defs["connectors/walmart"] = function (module, exports, require, __dirname) {
 // Walmart Chile (Lider.cl) — Walmart Marketplace API (mercado "cl"). El vendedor pega su Client ID y Secret Key
 // (Seller Center de Walmart › Configuración › Claves de API).
-// BETA: armado según la documentación pública de Walmart; se confirma con la primera cuenta real.
 // Etiqueta: mientras no se confirme cómo la entrega Walmart Chile por API, EtiquetaHub genera una etiqueta 10x15.
 const crypto = require('crypto');
 const cfg = require('../config');
@@ -2707,7 +2728,7 @@ async function setStock(conn, ref, qty) {
   await api(conn, `/v3/inventory?sku=${encodeURIComponent(ref)}`, { method: 'PUT', body: JSON.stringify({ sku: String(ref), quantity: { unit: 'EACH', amount: Math.max(0, qty) } }) });
 }
 
-module.exports = { test, listShipments, refresh, fetchLabel, sales, listings, stockListings, setStock, raw: api, toShipment, beta: true };
+module.exports = { test, listShipments, refresh, fetchLabel, sales, listings, stockListings, setStock, raw: api, toShipment };
 
 };
 
