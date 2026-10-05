@@ -1004,7 +1004,7 @@ function layoutItems(fonts, items) {
   return items.map(it => {
     const textW = PAGE_W - PAD * 2 - qtyW - (it.missing ? 46 : 0); // espacio para la marca "FALTA"
     const name = safeText(fonts.bold, it.name || 'Producto');
-    const variant = safeText(fonts.reg, it.variant || '');
+    const variant = safeText(fonts.reg, require('./marketplaces').prettyVariant(it.variant || ''));
     const sku = safeText(fonts.reg, [it.sku && `SKU ${it.sku}`, it.pub_id && it.pub_id !== it.sku && `ID ${it.pub_id}`].filter(Boolean).join('  ·  '));
     const lines = [
       ...wrap(fonts.bold, name, 9.5, textW).map(t => ({ t, f: fonts.bold, s: 9.5 })),
@@ -1554,7 +1554,7 @@ function normalize(order, items) {
   const group = new Map();
   for (const it of active) {
     const k = it.Sku || it.ShopSku;
-    if (!group.has(k)) group.set(k, { name: it.Name, variant: it.Variation && it.Variation !== '…' ? it.Variation : '', sku: it.Sku || '', pub_id: it.ShopSku || '', qty: 0 });
+    if (!group.has(k)) group.set(k, { name: it.Name, variant: it.Variation && it.Variation !== '…' ? require('../marketplaces').prettyVariant(it.Variation) : '', sku: it.Sku || '', pub_id: it.ShopSku || '', qty: 0 });
     group.get(k).qty += 1; // Falabella entrega 1 OrderItem por unidad
   }
   const statuses = active.map(i => String(i.Status).toLowerCase());
@@ -1663,7 +1663,7 @@ async function sales(conn, fromISO, toISO) {
     const g = new Map();
     for (const it of raw) {
       const k = it.Sku || it.ShopSku || it.Name;
-      if (!g.has(k)) g.set(k, { sku: it.Sku || '', pub_id: it.ShopSku || '', name: it.Name || 'Producto', variant: it.Variation && it.Variation !== '…' ? it.Variation : '', qty: 0, amount: 0 });
+      if (!g.has(k)) g.set(k, { sku: it.Sku || '', pub_id: it.ShopSku || '', name: it.Name || 'Producto', variant: it.Variation && it.Variation !== '…' ? require('../marketplaces').prettyVariant(it.Variation) : '', qty: 0, amount: 0 });
       const x = g.get(k); x.qty += 1; x.amount += Number(String(it.PaidPrice ?? it.ItemPrice ?? 0).replace(/[^0-9.]/g, '')) || 0;
     }
     const amount = Number(String(o.Price ?? o.GrandTotal ?? 0).replace(/[^0-9.]/g, '')) || [...g.values()].reduce((a, i) => a + i.amount, 0);
@@ -1999,7 +1999,31 @@ const isStore = k => (CATALOG[k] || {}).kind === 'store';
 // para la pantalla (sin funciones)
 const publicCatalog = () => Object.fromEntries(Object.entries(CATALOG).map(([k, v]) => [k, { ...v }]));
 
-module.exports = { CATALOG, ACTIVE, name, isStore, publicCatalog };
+
+// Variantes que llegan como texto técnico (Falabella: {"color":{"name":"Blanco","code":"#FFFFFF"},"size":"XXL LONG"})
+// se muestran en español: "Color: Blanco · Talla: XXL Long"
+const VAR_ES = { color: 'Color', colour: 'Color', size: 'Talla', talla: 'Talla', material: 'Material', model: 'Modelo', modelo: 'Modelo', flavor: 'Sabor', capacity: 'Capacidad', voltage: 'Voltaje', length: 'Largo', width: 'Ancho', style: 'Estilo', pattern: 'Diseño', gender: 'Género', age: 'Edad', quantity: 'Cantidad', pack: 'Pack', name: '' };
+const tidy = v => { const t = String(v ?? '').trim(); return /^[A-Z0-9 ]+$/.test(t) && /[A-Z]{3,}\s+[A-Z]{3,}/.test(t) ? t.split(/\s+/).map(w => /^(X{0,3}S|X{0,3}L|M|\d+[A-Z]*)$/.test(w) ? w : w[0] + w.slice(1).toLowerCase()).join(' ') : t; };
+function prettyVariant(v) {
+  const s = String(v ?? '').trim();
+  if (!s || !/^[{\[]/.test(s)) return s;
+  let o; try { o = JSON.parse(s); } catch { return s.replace(/[{}"\[\]]/g, '').replace(/,/g, ' · ').replace(/:/g, ': '); }
+  const parts = [];
+  const walk = (obj, label) => {
+    if (obj == null || obj === '') return;
+    if (Array.isArray(obj)) { obj.forEach(x => walk(x, label)); return; }
+    if (typeof obj === 'object') {
+      if ('name' in obj && typeof obj.name !== 'object') { parts.push((label ? label + ': ' : '') + tidy(obj.name)); return; }
+      for (const [k, x] of Object.entries(obj)) { if (/^(code|hex|id)$/i.test(k)) continue; const es = VAR_ES[k.toLowerCase()]; walk(x, es === undefined ? k.charAt(0).toUpperCase() + k.slice(1) : es); }
+      return;
+    }
+    parts.push((label ? label + ': ' : '') + tidy(obj));
+  };
+  walk(o, '');
+  return parts.join(' · ');
+}
+
+module.exports = { prettyVariant, CATALOG, ACTIVE, name, isStore, publicCatalog };
 
 };
 
@@ -3324,6 +3348,7 @@ const db = require('./db');
 
 const dayFmt = new Intl.DateTimeFormat('sv-SE', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
 const localDay = d => dayFmt.format(d);
+const PV = v => require('./marketplaces').prettyVariant(v || '');
 const today = () => localDay(new Date());
 const KEEP_DAYS = 400;
 // filtro por vendedor: un id, una lista de ids (todos los de un espacio) o null (sin filtro)
@@ -3546,6 +3571,7 @@ function products(sellerId, from, to, { excludeBlocked = false, onlyHandled = fa
   const daily = {}; // unidades por día y marketplace (para el gráfico)
   for (const r of rows) {
     if (isBlockedItem(r)) continue;
+    if (r.variant) r.variant = PV(r.variant);
     daily[r.day] = daily[r.day] || { ml: 0, fa: 0, pa: 0 }; daily[r.day][r.marketplace] = (daily[r.day][r.marketplace] || 0) + r.qty;
     // Mercado Libre: se agrupa por familia (variantes publicadas por separado) y si no hay, por publicación (MLC…)
     // si Mercado Libre no entrega familia, se agrupan los títulos que solo cambian en color o talla
@@ -3727,9 +3753,9 @@ function feed(sellerIds, limit = 80, { noMoney = false } = {}) {
       if (its.length && its.every(i => i.blocked)) return null;
       const okIts = its.filter(i => !i.blocked), blk = its.filter(i => i.blocked);
       const th = okIts.length ? thumbFor(r.marketplace, okIts) : '';
-      return { marketplace: r.marketplace, seller: r.seller, seller_id: r.seller_id, day: r.day, at, key: r.marketplace + ':' + r.external_id, thumb: th || thumb, units: okIts.reduce((a, i) => a + (i.qty || 1), 0) || r.units, items: okIts.map(i => ({ name: i.name, variant: i.variant, qty: i.qty })), blocked: blk.map(i => ({ name: i.name, variant: i.variant, qty: i.qty })) };
+      return { marketplace: r.marketplace, seller: r.seller, seller_id: r.seller_id, day: r.day, at, key: r.marketplace + ':' + r.external_id, thumb: th || thumb, units: okIts.reduce((a, i) => a + (i.qty || 1), 0) || r.units, items: okIts.map(i => ({ name: i.name, variant: PV(i.variant), qty: i.qty })), blocked: blk.map(i => ({ name: i.name, variant: PV(i.variant), qty: i.qty })) };
     }
-    return { ...r, key: r.marketplace + ':' + r.external_id, thumb, at, items: its.map(({ sku, pub_id, seller_id, marketplace, family_id, up_id, blocked, ...x }) => x) };
+    return { ...r, key: r.marketplace + ':' + r.external_id, thumb, at, items: its.map(({ sku, pub_id, seller_id, marketplace, family_id, up_id, blocked, ...x }) => ({ ...x, variant: PV(x.variant) })) };
   }).filter(Boolean);
   fillThumbs(missing).catch(() => {});
   if (noMoney) return { today: { n: out.filter(x => x.day === t).length }, items: out };
@@ -5411,7 +5437,7 @@ function trackUrl(o, meta, user) {
 const _plIns = () => db.prepare('INSERT OR IGNORE INTO print_log (order_id, by, at) VALUES (?,?,?)');
 function logPrint(id) { const o = db.prepare('SELECT printed_by, printed_at FROM orders WHERE id=?').get(id); if (o?.printed_at) _plIns().run(id, o.printed_by || '', o.printed_at); }
 function orderView(o, user) {
-  const items = JSON.parse(o.items);
+  const items = JSON.parse(o.items).map(it => it && it.variant ? { ...it, variant: require('./marketplaces').prettyVariant(it.variant) } : it);
   const blocked = sync.blockedBy(o);
   const seller = db.prepare('SELECT name FROM sellers WHERE id=?').get(o.seller_id);
   const meta = JSON.parse(o.meta || '{}');
