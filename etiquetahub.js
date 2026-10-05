@@ -1278,15 +1278,15 @@ async function dispatchBy(conn, sh) {
   const key = `${sh.id}:${sh.status}`;
   if (leadCache.has(key)) return leadCache.get(key);
   let d = null;
-  // 1) SLA de despacho de Mercado Libre: fecha/hora límite para despachar
+  // 1) SLA de despacho de Mercado Libre: fecha/hora límite para despachar (la que muestra Mercado Libre)
   try { const sla = await api(conn, `/shipments/${sh.id}/sla`); d = sla?.expected_date || null; } catch { /* sin dato */ }
   // 2) plazo de preparación que informa Mercado Libre para el envío
   if (!d) {
     try { const lt = await api(conn, `/shipments/${sh.id}/lead_time`); d = lt?.estimated_handling_limit?.date || lt?.buffering?.date || null; } catch { /* sin dato */ }
   }
-  // 3) último recurso: "pay_before" (es la hora límite de PAGO del comprador, no el corte de despacho)
-  if (!d) d = so.estimated_delivery_time?.pay_before || null;
-  d = d || so.estimated_delivery_time?.date || null;
+  // Solo se guarda un plazo real de despacho. Si Mercado Libre todavía no lo calculó (pasa justo después de la venta),
+  // NO se usa "pay_before": esa es la hora límite de PAGO del comprador y marcaba pedidos como atrasados a las 8:00.
+  // Se vuelve a preguntar en la próxima revisión.
   if (d) leadCache.set(key, d);
   return d;
 }
@@ -3046,6 +3046,22 @@ const connectors = {
   so: require('./connectors/falabella'), // Sodimac se vende por el mismo Seller Center de Falabella
   demo: require('./connectors/demo'),
 };
+
+// Reparación única (oct 2026): algunos pedidos de Mercado Libre guardaron como plazo de despacho la hora límite de PAGO
+// del comprador (8:00) y salían "atrasados" en la mañana. Se borra el plazo de los pedidos recientes que no han salido
+// para que se vuelva a pedir a Mercado Libre (su plazo real, p. ej. 16:00 en Agencia).
+try {
+  db.exec('CREATE TABLE IF NOT EXISTS app_flags (k TEXT PRIMARY KEY, at TEXT)');
+  if (!db.prepare("SELECT 1 FROM app_flags WHERE k='ml_payby_fix_1'").get()) {
+    const rows = db.prepare("SELECT id, meta FROM orders WHERE marketplace='ml' AND state NOT IN ('shipped','cancelled') AND created_at >= datetime('now','-3 day')").all();
+    const up = db.prepare('UPDATE orders SET meta=? WHERE id=?');
+    for (const r of rows) { let m = {}; try { m = JSON.parse(r.meta || '{}'); } catch { continue; } delete m.dispatch_by; delete m.dispatch_first; up.run(JSON.stringify(m), r.id); }
+    // esos falsos atrasos tampoco cuentan para la racha
+    try { const del = db.prepare('DELETE FROM late_log WHERE order_id=?'); for (const r of rows) del.run(r.id); } catch { /* sin registro aún */ }
+    db.prepare("INSERT INTO app_flags (k, at) VALUES ('ml_payby_fix_1', datetime('now'))").run();
+    console.log('[reparación] plazos de Mercado Libre recalculados:', rows.length);
+  }
+} catch (e) { console.warn('[reparación plazos]', e.message); }
 
 const bus = new EventEmitter();
 bus.setMaxListeners(200);
