@@ -3491,8 +3491,9 @@ function handledMl(sellerId, from) {
   const f = sidF(sellerId, 'seller_id');
   const since = new Date(new Date(from + 'T12:00:00Z').getTime() - 15 * 864e5).toISOString().slice(0, 19).replace('T', ' ');
   const ids = new Set();
-  for (const r of db.prepare(`SELECT meta, state FROM orders WHERE marketplace='ml' AND created_at >= ?${f.sql}`).all(since, ...f.args)) {
+  for (const r of db.prepare(`SELECT meta, state, order_number FROM orders WHERE marketplace='ml' AND created_at >= ?${f.sql}`).all(since, ...f.args)) {
     if (r.state === 'cancelled') continue;
+    if (r.order_number) ids.add(String(r.order_number)); // número de venta o de carrito (etiquetas antiguas no guardan sale_ids)
     try { for (const x of JSON.parse(r.meta || '{}').sale_ids || []) ids.add(String(x)); } catch { /* sin datos */ }
   }
   const first = db.prepare(`SELECT MIN(created_at) d FROM orders WHERE marketplace='ml'${f.sql}`).get(...f.args)?.d || null;
@@ -3511,10 +3512,11 @@ function products(sellerId, from, to, { excludeBlocked = false, onlyHandled = fa
     const h = handledMl(sellerId, from);
     const before = rows.length;
     let fullUnits = 0;
+    const blk = excludeBlocked ? blockedMatcher() : () => false;
     rows = rows.filter(r => {
       if (r.marketplace !== 'ml') return true;
       const ok = h.ids.has(String(r.order_id)) || (r.sale_pack && h.ids.has(String(r.sale_pack)));
-      if (!ok) fullUnits += r.qty || 1;
+      if (!ok && !blk(r)) fullUnits += r.qty || 1;
       return ok;
     });
     fullOut = { units: fullUnits, lines: before - rows.length, labels_since: h.since };
