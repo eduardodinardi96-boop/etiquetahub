@@ -2023,7 +2023,26 @@ function prettyVariant(v) {
   return parts.join(' · ');
 }
 
-module.exports = { prettyVariant, CATALOG, ACTIVE, name, isStore, publicCatalog };
+
+// Falabella en la nube del dueño (fulfillment propio): plazo INTERNO un día antes del plazo real de Falabella
+// (si cae domingo, el sábado), a la misma hora. Ej.: Falabella pide martes 13:00 → se exige lunes 13:00.
+// Devuelve { day:'YYYY-MM-DD', time:'HH:MM:SS', at: Date (hora de Chile) } o null si no aplica.
+function faOwnerDeadline(v, sellerId) {
+  if (!v || (require('./spaces').spaceOfSeller(sellerId) || 1) !== 1) return null;
+  const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3] - 1));
+  if (d.getUTCDay() === 0) d.setUTCDate(d.getUTCDate() - 1);
+  const day = d.toISOString().slice(0, 10), time = `${m[4]}:${m[5]}:${m[6] || '00'}`;
+  // hora de Chile → instante real (considera horario de verano)
+  const tz = require('./config').timezone || 'America/Santiago';
+  const guess = Date.UTC(+day.slice(0, 4), +day.slice(5, 7) - 1, +day.slice(8, 10), +m[4], +m[5], +(m[6] || 0));
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(guess)).map(x => [x.type, x.value]));
+  const asLocal = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
+  return { day, time, at: new Date(guess - (asLocal - guess)) };
+}
+
+module.exports = { faOwnerDeadline, prettyVariant, CATALOG, ACTIVE, name, isStore, publicCatalog };
 
 };
 
@@ -4101,10 +4120,18 @@ function lateKind(o, now) {
   const m = o.meta; if (!m.dispatch_by) return null;
   if (o.marketplace !== 'ml') {
     // Falabella / Paris: el día de despacho, desde las 20:00 sin que la agencia o el marketplace lo escanee → advertencia; al día siguiente → atrasado
+    const ship = require('./marketplaces').name(o.marketplace);
+    // Falabella en la nube del dueño: vale el plazo interno (un día antes, misma hora). Atrasado apenas pasa esa hora;
+    // advertencia en la última hora.
+    const fo = o.marketplace === 'fa' ? require('./marketplaces').faOwnerDeadline(m.dispatch_by, o.seller_id) : null;
+    if (fo) {
+      if (fo.at < now) return { level: 'late', kind: 'sin_escanear', ship };
+      if (fo.at - now <= 60 * 60e3) return { level: 'warn', kind: 'sin_escanear', ship };
+      return null;
+    }
     const v = String(m.dispatch_by), pd = new Date(v.includes('T') ? v : v.replace(' ', 'T'));
     const today = chileDay(now), dday = isNaN(pd) ? v.slice(0, 10) : chileDay(pd), h = chileHour(now);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dday) || dday > today) return null;
-    const ship = require('./marketplaces').name(o.marketplace);
     if (dday < today) return { level: 'late', kind: 'sin_escanear', ship };
     if (h >= 20) return { level: 'warn', kind: 'sin_escanear', ship };
     return null;
@@ -5667,7 +5694,7 @@ function orderView(o, user) {
     out: Boolean(meta.out) || ['shipped', 'delivered', 'not_delivered'].includes(meta.status), mk_cancelled: meta.status === 'cancelled' || Boolean(meta.cancelled),
     ml_downloaded: o.marketplace === 'ml' && meta.substatus === 'printed' && !['printed', 'shipped'].includes(o.state),
     prev_print: ['printed', 'shipped'].includes(o.state) ? null : (db.prepare('SELECT by, at FROM print_log WHERE order_id=? ORDER BY at DESC LIMIT 1').get(o.id) || null),
-    late, late_ml: late && meta.ml_delayed === true, resched: o.marketplace === 'ml' && meta.logistic === 'self_service' && /^rescheduled/.test(String(meta.substatus || '')), deadline: late ? lateDeadline(o.marketplace, meta)?.toISOString() : null, dl: warnDeadline(o, meta),
+    late, late_ml: late && meta.ml_delayed === true, resched: o.marketplace === 'ml' && meta.logistic === 'self_service' && /^rescheduled/.test(String(meta.substatus || '')), deadline: late ? lateDeadline(o.marketplace, meta, o.seller_id)?.toISOString() : null, dl: warnDeadline(o, meta),
   };
 }
 
@@ -5694,12 +5721,17 @@ function parisDay(v) {
 //  - Paris: hasta las 23:59 del día de despacho
 //  - Flex (Mercado Libre): hasta las 23:00 del día de despacho
 //  - Agencia/Colecta ML y Falabella: el horario que informa el marketplace
-function lateDeadline(mk, meta) {
+function lateDeadline(mk, meta, sellerId) {
   const v = meta.dispatch_by; if (!v) return null;
   if (mk === 'pa') { const day = parisDay(v); return day ? chileAt(day, '23:59:59') : null; }
   const d = parseD(v); if (!d) return null;
   // Falabella: escaneado por la agencia/Falabella dentro del día de su plazo
-  if (mk === 'fa') return chileAt(String(v).slice(0, 10), '23:59:59');
+  if (mk === 'fa') {
+    // nube del dueño: el plazo interno (un día antes, misma hora). Demás nubes: hasta las 23:59 del día de Falabella
+    const f = require('./marketplaces').faOwnerDeadline(v, sellerId);
+    if (f) return f.at;
+    return chileAt(String(v).slice(0, 10), '23:59:59');
+  }
   if (mk === 'ml' && meta.logistic === 'self_service') {
     // Flex: vale el primer plazo que dio Mercado Libre (si lo corrió a otro día es porque no se entregó a tiempo)
     const f = parseD(meta.dispatch_first); const base = f && f < d ? f : d;
@@ -5716,7 +5748,7 @@ function isLate(o, meta) {
   if (meta.out && !flex) return false;
   if (flex && /^rescheduled/.test(String(meta.substatus || ''))) return false; // reprogramada por Mercado Libre: no es atraso
   if (meta.ml_delayed === true) return true; // Mercado Libre la marca atrasada
-  const dl = lateDeadline(o.marketplace, meta);
+  const dl = lateDeadline(o.marketplace, meta, o.seller_id);
   return Boolean(dl && dl < new Date());
 }
 // Plazo límite (para "Advertencia": faltan 30 minutos o menos) solo si el paquete aún puede atrasarse
@@ -5724,18 +5756,14 @@ function warnDeadline(o, meta) {
   if (['shipped', 'cancelled'].includes(o.state) || meta.status === 'cancelled' || meta.cancelled) return null;
   if (meta.out && !(o.marketplace === 'ml' && meta.logistic === 'self_service')) return null;
   if (o.marketplace === 'ml' && meta.logistic === 'self_service' && /^rescheduled/.test(String(meta.substatus || ''))) return null;
-  return lateDeadline(o.marketplace, meta)?.toISOString() || null;
+  return lateDeadline(o.marketplace, meta, o.seller_id)?.toISOString() || null;
 }
 function dispatchView(mk, v, sellerId) {
   if (!v) return null;
-  if (mk === 'fa' && (spaces.spaceOfSeller(sellerId) || 1) === 1) {
-    // Solo en la nube del dueño (fulfillment propio): Falabella da 2 días para preparar y se despacha un día
-    // antes del plazo (si cae domingo, el sábado). En las demás nubes se muestra el plazo real de Falabella.
-    const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}:\d{2}(?::\d{2})?)/);
-    if (!m) return v;
-    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3] - 1));
-    if (d.getUTCDay() === 0) d.setUTCDate(d.getUTCDate() - 1);
-    return d.toISOString().slice(0, 10) + ' ' + m[4];
+  if (mk === 'fa') {
+    // Solo en la nube del dueño (fulfillment propio): se muestra el plazo interno (un día antes del de Falabella).
+    const f = require('./marketplaces').faOwnerDeadline(v, sellerId);
+    if (f) return f.day + ' ' + f.time;
   }
   if (mk !== 'pa') return v;
   const day = parisDay(v);
@@ -6122,6 +6150,14 @@ async function route(req, res) {
     if (view === 'all') where.push("(state <> 'shipped' OR printed_at >= datetime('now','-7 day'))");
     if (view === 'all') where.push("(created_at >= datetime('now','-7 day') OR state NOT IN ('printed','cancelled','shipped') OR printed_at >= datetime('now','-8 day') OR (block_no IS NOT NULL AND printed_at >= datetime('now','-30 day')))");
     const rows = db.prepare(`SELECT * FROM orders ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT 1000`).all(...args);
+    // Los pedidos más antiguos que siguen pendientes (plazo de los últimos 7 días, sin despachar) siempre se incluyen,
+    // aunque queden fuera de los últimos 1000: así la Bandeja muestra los mismos atrasados que MKP Flash.
+    if (view === 'all' && rows.length >= 1000) {
+      const f = spaces.inList(vis, 'seller_id');
+      const minId = rows[rows.length - 1].id;
+      const extra = db.prepare(`SELECT * FROM orders WHERE ${f.sql} AND id < ? AND state NOT IN ('shipped','cancelled') AND created_at >= datetime('now','-30 day') AND json_valid(meta) AND json_extract(meta,'$.dispatch_by') >= date('now','-7 day') ORDER BY id DESC LIMIT 500`).all(...f.args, minId);
+      rows.push(...extra);
+    }
     const sellers = db.prepare('SELECT id, name FROM sellers WHERE space_id=? ORDER BY name').all(user.space_id || 1);
     return ok(res, { orders: rows.map(o => orderView(o, user)), sellers });
   }
