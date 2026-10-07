@@ -3271,7 +3271,8 @@ async function upsert(conn, s) {
   }
   // Si la imprimieron en Mercado Libre (y no fue la app la que la descargó), pasa a impresa
   // Mercado Libre dice que la etiqueta ya se imprimió: pasa a impresa (salvo que alguien la haya marcado "no impresa" a mano)
-  if (printedOutside && ['ready', 'waiting', 'error'].includes(state) && !existing.unprinted_at) {
+  // si la etiqueta la descargó la propia app (label_at), el "listo para despacho" lo puso la app: NO es una impresión en Falabella
+  if (printedOutside && !existing.label_at && ['ready', 'waiting', 'error'].includes(state) && !existing.unprinted_at) {
     state = 'printed';
     db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by=? WHERE id=?`).run(`Impresa en ${MKNAME[mk] || 'el marketplace'}`, existing.id);
     logEvent(existing.seller_id, 'print', `Pedido ${existing.order_number}: impreso directamente en ${MKNAME[mk] || 'el marketplace'}`);
