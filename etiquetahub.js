@@ -4115,6 +4115,9 @@ async function mlAccount(row) {
     acc.messages = await pmap(list, 5, async ({ r, pack }) => {
       const [th, info] = await Promise.all([safe(() => ml.raw(conn, `/messages/packs/${pack}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=10`), null), orderInfo(conn, pack)]);
       const raw = th.v?.messages || [];
+      // Si en Mercado Libre ya se marcó como leída (todos los mensajes del comprador tienen fecha de lectura), no se muestra
+      const buyerMsgs = raw.filter(x => String(x.from?.user_id) !== String(uid));
+      if (th.ok && buyerMsgs.length && buyerMsgs.every(x => x.message_date && x.message_date.read)) return null;
       const msgs = raw.map(x => ({ from: String(x.from?.user_id) === String(uid) ? 'seller' : 'buyer', text: x.text, date: x.message_date?.created || x.date_created, att: (x.message_attachments || x.attachments || []).map(a => ({ f: a.filename || a.file_name, n: a.original_filename || a.filename, t: a.type || '' })).filter(a => a.f) })).sort((a, b) => String(a.date).localeCompare(String(b.date)));
       const buyerId = info.buyer_id || raw.map(x => String(x.from?.user_id) === String(uid) ? x.to?.user_id : x.from?.user_id).find(Boolean);
       // Conversación cerrada: devolución, reclamo/mediación o venta cancelada → no se muestra (ya no hay nada que responder)
@@ -4207,7 +4210,7 @@ async function faReturns(row) {
 }
 
 // Cada cuenta se guarda aparte: la pantalla recibe al instante lo último que se tiene y, si ya tiene
-// más de 90 s, se vuelve a consultar en segundo plano (la próxima vez aparece actualizado).
+// más de 30 s, se vuelve a consultar en segundo plano (la próxima vez aparece actualizado).
 const accCache = new Map(); // connId -> { at, data, p }
 const seenQ = new Map(); // connId -> Set(id de preguntas ya vistas)
 function loadAcc(r) {
@@ -4221,7 +4224,7 @@ function loadAcc(r) {
 }
 async function getAcc(r, force) {
   const c = accCache.get(r.id);
-  if (c && c.data && !force) { if (Date.now() - c.at > 90e3) loadAcc(r); return c.data; }
+  if (c && c.data && !force) { if (Date.now() - c.at > 30e3) loadAcc(r); return c.data; }
   const seller = db.prepare('SELECT name FROM sellers WHERE id=?').get(r.seller_id)?.name || '';
   const wait = new Promise(res => setTimeout(() => res(null), force ? 45000 : 25000));
   const d = await Promise.race([loadAcc(r), wait]);
@@ -4413,7 +4416,14 @@ async function markRead(user, connId, packId) {
   const conn = connFor(user, connId);
   const uid = conn.creds.user_id;
   if (!/^\d+$/.test(String(packId || ''))) throw Object.assign(new Error('Conversación inválida'), { status: 400 });
-  await ml.raw(conn, `/messages/packs/${packId}/sellers/${uid}?tag=post_sale&mark_as_read=true&limit=10`);
+  // 1) se buscan los mensajes del comprador que siguen sin leer y se marcan como leídos con la orden directa de Mercado Libre
+  try {
+    const th = await ml.raw(conn, `/messages/packs/${packId}/sellers/${uid}?tag=post_sale&mark_as_read=false&limit=50`);
+    const ids = (th?.messages || []).filter(x => String(x.from?.user_id) !== String(uid) && !(x.message_date && x.message_date.read)).map(x => x.id).filter(Boolean);
+    if (ids.length) await ml.apiSend(conn, 'PUT', `/messages/mark_as_read/${ids.join(',')}?tag=post_sale`);
+  } catch (e) { console.warn('[mkp] mark_as_read', packId, e.message); }
+  // 2) además se abre la conversación como lo hace Mercado Libre (eso también la deja leída)
+  await ml.raw(conn, `/messages/packs/${packId}/sellers/${uid}?tag=post_sale&mark_as_read=true&limit=50`);
   const c = accCache.get(Number(connId));
   if (c?.data?.messages) c.data.messages = c.data.messages.filter(m => String(m.pack_id) !== String(packId));
 }
