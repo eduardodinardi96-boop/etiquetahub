@@ -6173,8 +6173,8 @@ async function route(req, res) {
   const spaceSt = spaces.status(space);
   const mods = spaces.modulesOf(space);
   const isOwner = Boolean(user.superadmin) || Boolean(user.impersonator_id && db.prepare('SELECT superadmin FROM users WHERE id=?').get(user.impersonator_id)?.superadmin);
-  // "Ventas sin Full": el dueño de la app y el usuario "Gmail Proveedor" (lo pidió el dueño)
-  const allNfAccess = isOwner || String(user.name || '').trim().toLowerCase().replace(/\s+/g, ' ') === 'gmail proveedor';
+  // "Ventas sin Full": el dueño de la app y el usuario "gema proveedor" (ventasycomprobantes@gmail.com), lo pidió el dueño
+  const allNfAccess = isOwner || String(user.email || '').trim().toLowerCase() === 'ventasycomprobantes@gmail.com';
   const sids = spaces.sellerIds(user);          // sobre los que puede actuar (vendedor: el suyo)
   const vis = spaces.spaceSellerIds(user);      // los que puede ver (todo su espacio)
   if (!spaceSt.active && !isOwner && !p.startsWith('/api/billing') && !['/api/me', '/api/logout', '/api/me/password', '/api/stream', '/api/impersonate/stop', '/api/undo'].includes(p)) {
