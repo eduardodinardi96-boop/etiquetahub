@@ -6215,6 +6215,8 @@ async function route(req, res) {
 
   if (p === '/health') return ok(res, { ok: true, demo: cfg.demo, v: appVersion() });
 
+  if (!global.__bxLog) global.__bxLog = {};
+  const bxLog = global.__bxLog;
   // Robot de etiquetas Blue Express: corre en el navegador del vendedor (app Blue Express dentro de Shopify).
   // Se identifica con la clave del vendedor (?key=bx_…), no con la sesión de EtiquetaHub.
   if (p.startsWith('/api/bx-robot/')) {
@@ -6225,6 +6227,14 @@ async function route(req, res) {
     if (!sid) return send(res, 403, { error: 'Clave no válida' }, cors);
     carrier.touch(sid);
     if (p === '/api/bx-robot/pending' && m === 'GET') return send(res, 200, { pending: carrier.pending(sid) }, cors);
+    // Bitácora del robot (para revisar qué hizo cada vuelta)
+    if (p === '/api/bx-robot/log' && m === 'POST') {
+      let b = {}; try { b = await readBody(req); } catch {}
+      const list = (bxLog[sid] ||= []);
+      list.push({ at: new Date().toISOString(), msg: String(b.msg || '').slice(0, 300), data: b.data == null ? null : JSON.stringify(b.data).slice(0, 2000) });
+      if (list.length > 80) list.splice(0, list.length - 80);
+      return send(res, 200, { ok: true }, cors);
+    }
     if (p === '/api/bx-robot/label' && m === 'POST') {
       if (handoff.frozen()) return send(res, 503, { error: 'Actualizando, reintenta en un minuto' }, cors);
       const chunks = []; let n = 0;
@@ -6602,6 +6612,12 @@ async function route(req, res) {
     const sid = Number(url.searchParams.get('seller'));
     if (!sid || !db.prepare('SELECT id FROM sellers WHERE id=?').get(sid)) return fail(res, 404, 'Vendedor no encontrado');
     return ok(res, { seller_id: sid, key: require('./carrier').keyFor(sid) });
+  }
+  if (p === '/api/admin/bx-robot-log' && m === 'GET') {
+    if (!isOwner) return fail(res, 403, 'Solo el dueño de la app');
+    const sid = Number(url.searchParams.get('seller'));
+    const ls = db.prepare('SELECT last_seen FROM carrier_keys WHERE seller_id=?').get(sid);
+    return ok(res, { last_seen: ls?.last_seen || null, log: (global.__bxLog || {})[sid] || [] });
   }
   const cdel = p.match(/^\/api\/orders\/(\d+)\/carrier-label$/);
   if (cdel && m === 'DELETE') {
