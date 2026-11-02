@@ -1436,7 +1436,36 @@ function remove(orderId) {
   if (o?.label_file) { fs.rmSync(path.join(cfg.dataDir, 'labels', `${o.id}.pdf`), { force: true }); db.prepare('UPDATE orders SET label_file=NULL WHERE id=?').run(o.id); }
 }
 
-module.exports = { upload, remove, hasCarrier, carrierPath, matchOrder, OWN_STORES };
+// ---------- Robot de etiquetas ----------
+// Un robot que corre en el navegador del vendedor (dentro de la app Blue Express de Shopify) baja cada etiqueta
+// y la manda aquí con una clave propia del vendedor (no usa la sesión de EtiquetaHub).
+db.exec(`CREATE TABLE IF NOT EXISTS carrier_keys (key TEXT PRIMARY KEY, seller_id INTEGER NOT NULL, created_at TEXT DEFAULT (datetime('now')))`);
+function keyFor(sellerId) {
+  const r = db.prepare('SELECT key FROM carrier_keys WHERE seller_id=?').get(sellerId);
+  if (r) return r.key;
+  const k = 'bx_' + require('crypto').randomBytes(24).toString('hex');
+  db.prepare('INSERT INTO carrier_keys (key, seller_id) VALUES (?,?)').run(k, sellerId);
+  return k;
+}
+function sellerOfKey(k) {
+  if (!/^bx_[0-9a-f]{48}$/.test(String(k || ''))) return null;
+  return db.prepare('SELECT seller_id FROM carrier_keys WHERE key=?').get(k)?.seller_id || null;
+}
+// Pedidos de tienda propia del vendedor que todavía esperan la etiqueta del courier (aún no impresos)
+function pending(sellerId) {
+  return db.prepare(`SELECT id, order_number, meta FROM orders WHERE seller_id=? AND marketplace IN ('sh','wc','js') AND state IN ('ready','waiting','error') AND created_at >= datetime('now','-15 day') ORDER BY id`).all(sellerId)
+    .filter(o => !hasCarrier(o.id)).map(o => ({ order_number: o.order_number, customer: (() => { try { return JSON.parse(o.meta || '{}').customer || ''; } catch { return ''; } })() }));
+}
+// El robot manda la etiqueta de un pedido por su número (#1031)
+async function uploadByNumber(bytes, sellerId, orderNumber) {
+  const n = String(orderNumber || '').replace(/^#/, '').trim();
+  if (!n) throw Object.assign(new Error('Falta el número de pedido'), { status: 400 });
+  const o = db.prepare(`SELECT id FROM orders WHERE seller_id=? AND marketplace IN ('sh','wc','js') AND order_number=? ORDER BY id DESC`).get(sellerId, n);
+  if (!o) throw Object.assign(new Error('Pedido no encontrado: ' + n), { status: 404 });
+  return upload(bytes, { orderId: o.id, visible: [sellerId] });
+}
+
+module.exports = { upload, remove, hasCarrier, carrierPath, matchOrder, OWN_STORES, keyFor, sellerOfKey, pending, uploadByNumber };
 
 };
 
@@ -6143,6 +6172,31 @@ async function route(req, res) {
 
   if (p === '/health') return ok(res, { ok: true, demo: cfg.demo, v: appVersion() });
 
+  // Robot de etiquetas Blue Express: corre en el navegador del vendedor (app Blue Express dentro de Shopify).
+  // Se identifica con la clave del vendedor (?key=bx_…), no con la sesión de EtiquetaHub.
+  if (p.startsWith('/api/bx-robot/')) {
+    const cors = { 'access-control-allow-origin': '*', 'access-control-allow-methods': 'GET, POST, OPTIONS', 'access-control-allow-headers': 'content-type' };
+    if (m === 'OPTIONS') return send(res, 204, '', cors);
+    const carrier = require('./carrier');
+    const sid = carrier.sellerOfKey(url.searchParams.get('key'));
+    if (!sid) return send(res, 403, { error: 'Clave no válida' }, cors);
+    if (p === '/api/bx-robot/pending' && m === 'GET') return send(res, 200, { pending: carrier.pending(sid) }, cors);
+    if (p === '/api/bx-robot/label' && m === 'POST') {
+      if (handoff.frozen()) return send(res, 503, { error: 'Actualizando, reintenta en un minuto' }, cors);
+      const chunks = []; let n = 0;
+      for await (const c of req) { n += c.length; if (n > 35e6) return send(res, 413, { error: 'Muy grande' }, cors); chunks.push(c); }
+      let buf = Buffer.concat(chunks);
+      // acepta el PDF tal cual o en base64 (texto, con o sin "data:application/pdf;base64,")
+      if (buf.slice(0, 5).toString('latin1') !== '%PDF-') buf = Buffer.from(buf.toString('latin1').replace(/^data:[^,]*,/, '').replace(/\s+/g, ''), 'base64');
+      try {
+        const r = await carrier.uploadByNumber(buf, sid, url.searchParams.get('order'));
+        for (const x of r.matched) sync.bus.emit('change', { type: 'order', orderId: x.id, sellerId: sid });
+        return send(res, 200, r, cors);
+      } catch (e) { return send(res, e.status || 400, { error: e.message }, cors); }
+    }
+    return send(res, 404, { error: 'No existe' }, cors);
+  }
+
   // Respaldo cifrado de la base de datos (lo guarda GitHub Actions; sin APP_SECRET es ilegible)
   if (p === '/backup.enc' && m === 'GET') {
     // Traspaso a una versión nueva: la versión nueva pide la base firmada con "handoff". Desde ese momento esta
@@ -6496,6 +6550,13 @@ async function route(req, res) {
       for (const x of r.matched) sync.bus.emit('change', { type: 'order', orderId: x.id, sellerId: null });
       return ok(res, r);
     } catch (e) { return fail(res, e.status || 400, e.message); }
+  }
+  // Clave del robot de etiquetas de un vendedor (solo el dueño de la app)
+  if (p === '/api/admin/carrier-key' && m === 'GET') {
+    if (!isOwner) return fail(res, 403, 'Solo el dueño de la app');
+    const sid = Number(url.searchParams.get('seller'));
+    if (!sid || !db.prepare('SELECT id FROM sellers WHERE id=?').get(sid)) return fail(res, 404, 'Vendedor no encontrado');
+    return ok(res, { seller_id: sid, key: require('./carrier').keyFor(sid) });
   }
   const cdel = p.match(/^\/api\/orders\/(\d+)\/carrier-label$/);
   if (cdel && m === 'DELETE') {
