@@ -4166,8 +4166,11 @@ function start() {
 
 // Foto de cada producto de un pedido (para la Bandeja). Las que faltan se piden al marketplace en segundo plano.
 const thumbWant = new Map(); let thumbTimer = null;
+// Antes Shopify no se consultaba y quedó guardado "sin foto": se borra para pedirla de nuevo
+try { db.prepare("DELETE FROM item_thumb WHERE marketplace='sh' AND (url IS NULL OR url='')").run(); } catch {}
 function itemThumbs(o, items) {
-  const q = db.prepare('SELECT url FROM item_thumb WHERE marketplace=? AND key=?');
+  // las que quedaron "sin foto" se vuelven a intentar una vez al día
+  const q = db.prepare("SELECT url FROM item_thumb WHERE marketplace=? AND key=? AND NOT (url='' AND fetched_at < datetime('now','-1 day'))");
   return items.map(it => {
     const key = o.marketplace === 'fa' ? it.sku : it.pub_id; if (!key || !['ml', 'fa', 'sh'].includes(o.marketplace)) return '';
     const t = q.get(o.marketplace, String(key));
