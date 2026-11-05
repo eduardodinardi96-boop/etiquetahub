@@ -4657,7 +4657,7 @@ db.exec(`CREATE TABLE IF NOT EXISTS item_cost (seller_id INTEGER NOT NULL, marke
   cost REAL, fee_pct REAL, ship REAL, tacos REAL, updated_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (seller_id, marketplace, key));
 CREATE TABLE IF NOT EXISTS profit_cache (seller_id INTEGER PRIMARY KEY, data TEXT, at INTEGER);`);
 
-const CACHE_V = 10; // sube cuando cambia el cálculo, para rehacer la caché
+const CACHE_V = 11; // sube cuando cambia el cálculo, para rehacer la caché
 const DEFAULT_FEE = { fa: 18, pa: 18 }; // % por defecto si la API no entrega la comisión (vestuario en Paris = 18%)
 const num = v => { const n = Number(String(v ?? '').replace(/[^0-9.\-]/g, '')); return isFinite(n) ? n : 0; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -4710,10 +4710,22 @@ async function mlListings(conn, errors) {
     if ((r?.results || []).length < 100) break;
   }
   const items = [];
+  // Mercado Libre a veces rechaza una consulta al azar (403 "ResourceDeprecated"): se reintenta y, si sigue,
+  // se piden de a una; una publicación que no responde se salta sin botar todas las demás
+  const ATTR = 'id,title,price,listing_type_id,category_id,thumbnail,secure_thumbnail,shipping,attributes,seller_custom_field,permalink,sold_quantity,family_name';
+  let skipped = 0;
   for (let i = 0; i < ids.length; i += 20) {
-    const r = await ml.raw(conn, `/items?ids=${ids.slice(i, i + 20).join(',')}&attributes=id,title,price,listing_type_id,category_id,thumbnail,secure_thumbnail,shipping,attributes,seller_custom_field,permalink,sold_quantity,family_name`);
-    for (const x of r || []) if (x?.code === 200 && x.body) items.push(x.body);
+    const chunk = ids.slice(i, i + 20);
+    let r = null;
+    for (let t = 0; t < 3 && !r; t++) { try { r = await ml.raw(conn, `/items?ids=${chunk.join(',')}&attributes=${ATTR}`); } catch { await sleep(1500 * (t + 1)); } }
+    if (r) { for (const x of r || []) if (x?.code === 200 && x.body) items.push(x.body); continue; }
+    for (const id of chunk) {
+      let b = null;
+      for (let t = 0; t < 2 && !b; t++) { try { b = await ml.raw(conn, `/items/${id}?attributes=${ATTR}`); } catch { await sleep(1000); } }
+      if (b?.id) items.push(b); else skipped++;
+    }
   }
+  if (skipped) { errors.push(`Mercado Libre no entregó ${skipped} publicación(es); se reintenta en 45 minutos.`); errors.adsAuth = true; }
   // Mercado Ads: gasto y TACOS por publicación (últimos 30 días)
   const soldMap = sales30(conn.row?.seller_id);
   const ads = await mlAds(conn).catch(e => { if (/UNAUTHORIZED|403/.test(String(e.message))) errors.adsAuth = true; const msg = /UNAUTHORIZED|403/.test(String(e.message)) ? 'El TACOS automático aún no llega para esta cuenta: Mercado Libre activa el permiso de Publicidad cuando renueva el acceso (lo hace solo cada pocas horas; la app reintenta cada 45 minutos). Mientras tanto puedes escribirlo a mano.' : 'Mercado Ads: ' + String(e.message || e).slice(0, 160); if (!errors.includes(msg)) errors.push(msg); return null; });
@@ -4929,7 +4941,12 @@ async function build(sellerId) {
       if (['rp', 'wm'].includes(c.marketplace)) rows.push(...await storeListings(conn, c.marketplace, sellerId, errors));
       if (c.marketplace === 'pa') rows.push(...await paListings(conn, sellerId, errors));
       if (require('./marketplaces').isStore(c.marketplace)) rows.push(...await storeListings(conn, c.marketplace, sellerId, errors));
-    } catch (e) { errors.push(`${c.marketplace.toUpperCase()}: ${String(e.message).slice(0, 160)}`); }
+    } catch (e) {
+      errors.push(`${c.marketplace.toUpperCase()}: ${String(e.message).slice(0, 160)}`); errors.adsAuth = true;
+      // si un marketplace falla, se mantienen sus publicaciones del armado anterior (no desaparecen del calculador)
+      const prev = (cached(sellerId)?.items || []).filter(r => r.mk === c.marketplace && (r.conn_id == null || r.conn_id === c.id));
+      if (prev.length && !rows.some(r => r.mk === c.marketplace && (r.conn_id == null || r.conn_id === c.id))) rows.push(...prev);
+    }
   }
   const data = { items: rows, errors: [...errors], v: CACHE_V, retry: Boolean(errors.adsAuth), pricesAt: Date.now() };
   db.prepare('INSERT INTO profit_cache (seller_id, data, at) VALUES (?,?,?) ON CONFLICT(seller_id) DO UPDATE SET data=excluded.data, at=excluded.at').run(sellerId, JSON.stringify(data), Date.now());
