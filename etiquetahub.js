@@ -1479,7 +1479,86 @@ async function uploadByNumber(bytes, sellerId, orderNumber) {
   return upload(bytes, { orderId: o.id, visible: [sellerId] });
 }
 
-module.exports = { upload, remove, hasCarrier, carrierPath, matchOrder, OWN_STORES, keyFor, sellerOfKey, pending, uploadByNumber, touch, holds, HOLD_NOTE };
+
+// ---------- Escaneo de Blue Express ----------
+// Cuando el centro de envío / Punto Blue Express recibe el paquete, el seguimiento público de Blue Express deja de decir
+// "En preparación". Ahí el pedido se da por enviado (sale de Atrasados) sin esperar a que la app de Blue Express marque
+// el pedido como preparado en Shopify (eso lo hace recién al día siguiente).
+db.exec(`CREATE TABLE IF NOT EXISTS carrier_track (order_id INTEGER PRIMARY KEY, tracking TEXT, last_code TEXT, macro TEXT, moved_at TEXT, scanned_at TEXT, checked_at TEXT, err TEXT)`);
+const bxLog = [];
+const note = (m, d) => { bxLog.unshift({ at: new Date().toISOString(), m, d: d ?? null }); bxLog.length = Math.min(bxLog.length, 60); };
+async function bxQuery(os) {
+  const { request } = require('./http');
+  const r = await request('https://www.blue.cl/api/tracking', { method: 'POST', timeout: 20000, headers: { 'content-type': 'application/json', accept: 'application/json', 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36', origin: 'https://www.blue.cl', referer: `https://www.blue.cl/enviar/seguimiento?n_seguimiento=${os}` }, body: JSON.stringify({ os: String(os) }) }, { retries: 1 });
+  const tm = r?.data?.macroState?.data?.traceMacrostates, gi = r?.data?.generalInfo?.data;
+  if (!tm && !gi) return null;
+  const active = (tm?.macrostates || []).find(x => x.isActive);
+  return { code: tm?.lastEventCode || gi?.lastEventCode || '', macro: active?.id || '', title: active?.title || '', refs: (gi?.reference || []).map(String), moved: gi?.lastDateMovement || '' };
+}
+// Número de seguimiento: se lee del PDF de la etiqueta y se confirma con Blue Express (la referencia trae "#1072")
+async function trackingOf(o) {
+  const t = db.prepare('SELECT tracking FROM carrier_track WHERE order_id=?').get(o.id)?.tracking;
+  if (t) return t;
+  if (!hasCarrier(o.id)) return null;
+  const text = await pdftotext(fs.readFileSync(carrierPath(o.id)));
+  const cands = [...new Set(String(text || '').match(/\b\d{10}\b/g) || [])].slice(0, 6);
+  for (const c of cands) {
+    try {
+      const q = await bxQuery(c);
+      if (q && q.refs.some(x => x === '#' + o.order_number || x === String(o.external_id))) {
+        db.prepare('INSERT INTO carrier_track (order_id, tracking) VALUES (?,?) ON CONFLICT(order_id) DO UPDATE SET tracking=excluded.tracking').run(o.id, c);
+        return c;
+      }
+    } catch (e) { note('consulta Blue Express falló', String(e.message).slice(0, 200)); throw e; }
+  }
+  note(`pedido #${o.order_number}: no encontré el número de seguimiento en la etiqueta`, cands);
+  return null;
+}
+let bxRunning = false;
+async function checkScans(onlyId = null) {
+  if (bxRunning) return { busy: true };
+  bxRunning = true;
+  const done = [];
+  try {
+    const rows = db.prepare(`SELECT * FROM orders WHERE marketplace IN ('sh','wc','js') AND state IN ('ready','printed','waiting','error') AND created_at >= datetime('now','-15 day')${onlyId ? ' AND id=?' : ''} ORDER BY id`).all(...(onlyId ? [onlyId] : []));
+    for (const o of rows) {
+      let m = {}; try { m = JSON.parse(o.meta || '{}'); } catch {}
+      if (!/blue/i.test(String(m.carrier || '')) || !hasCarrier(o.id)) continue;
+      let os;
+      try { os = await trackingOf(o); } catch { break; } // Blue Express no responde: se intenta en la próxima vuelta
+      if (!os) continue;
+      let q;
+      try { q = await bxQuery(os); } catch (e) { db.prepare("UPDATE carrier_track SET checked_at=datetime('now'), err=? WHERE order_id=?").run(String(e.message).slice(0, 200), o.id); note('consulta Blue Express falló', String(e.message).slice(0, 200)); break; }
+      if (!q) continue;
+      const scanned = q.macro && q.macro !== 'IN_PREPARATION';
+      db.prepare("UPDATE carrier_track SET last_code=?, macro=?, moved_at=?, checked_at=datetime('now'), err=NULL, scanned_at=CASE WHEN ? THEN COALESCE(scanned_at, datetime('now')) ELSE scanned_at END WHERE order_id=?").run(q.code, q.macro, q.moved, scanned ? 1 : 0, o.id);
+      if (!scanned) continue;
+      // recibido por Blue Express: se da por enviado (igual que cuando Shopify lo marca preparado)
+      db.prepare(`UPDATE orders SET state='shipped', printed_at=COALESCE(printed_at, datetime('now')), printed_by=COALESCE(printed_by, 'Recepcionada por Blue Express'), updated_at=datetime('now') WHERE id=? AND state <> 'shipped'`).run(o.id);
+      try { const sync = require('./sync'); sync.logEvent?.(o.seller_id, 'order', `Pedido ${o.order_number}: Blue Express ya lo recibió (${q.title || q.code})`); sync.bus?.emit('change', { type: 'order', orderId: o.id, sellerId: o.seller_id }); } catch { /* opcional */ }
+      done.push(o.order_number);
+      await new Promise(r => setTimeout(r, 400));
+    }
+  } finally { bxRunning = false; }
+  if (done.length) note('pedidos recibidos por Blue Express', done);
+  return { shipped: done };
+}
+function scanLog(sellerId) {
+  const rows = db.prepare(`SELECT t.*, o.order_number, o.state FROM carrier_track t JOIN orders o ON o.id=t.order_id WHERE (? IS NULL OR o.seller_id=?) ORDER BY t.order_id DESC LIMIT 60`).all(sellerId || null, sellerId || null);
+  return { rows, log: bxLog };
+}
+// Revisión cada 5 horas y, sí o sí, una a las 20:00 (hora de Chile). Corre en el servidor: no depende del computador.
+const runScans = why => { note('revisión ' + why); checkScans().catch(e => note('error', e.message)); };
+setTimeout(() => runScans('al iniciar'), 2 * 60e3).unref?.();
+setInterval(() => runScans('cada 5 horas'), 5 * 3600e3).unref?.();
+let lastEvening = '';
+setInterval(() => {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hour12: false }).formatToParts(new Date()).map(x => [x.type, x.value]));
+  const day = `${p.year}-${p.month}-${p.day}`;
+  if (Number(p.hour) === 20 && lastEvening !== day) { lastEvening = day; runScans('de las 20:00'); }
+}, 60e3).unref?.();
+
+module.exports = { checkScans, scanLog, upload, remove, hasCarrier, carrierPath, matchOrder, OWN_STORES, keyFor, sellerOfKey, pending, uploadByNumber, touch, holds, HOLD_NOTE };
 
 };
 
@@ -6674,6 +6753,14 @@ async function route(req, res) {
     if (m === 'GET') return ok(res, { notices: N.list(Number(url.searchParams.get('seller')) || null) });
     const b = await readBody(req);
     try { return ok(res, N.create(Number(b.seller_id), b.title, b.body, user.name || user.email)); } catch (e) { return fail(res, e.status || 400, e.message); }
+  }
+  // Escaneo de Blue Express (tiendas propias): ver estado y forzar una revisión
+  if (p === '/api/admin/bx-track' && m === 'GET') {
+    if (!isOwner) return fail(res, 403, 'Solo el dueño de la app');
+    const C = require('./carrier');
+    let run = null;
+    if (url.searchParams.get('run') === '1') run = await C.checkScans(Number(url.searchParams.get('order')) || null).catch(e => ({ error: e.message }));
+    return ok(res, { run, ...C.scanLog(Number(url.searchParams.get('seller')) || null) });
   }
   if (p === '/api/admin/bx-robot-log' && m === 'GET') {
     if (!isOwner) return fail(res, 403, 'Solo el dueño de la app');
