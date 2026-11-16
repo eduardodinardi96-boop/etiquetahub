@@ -900,7 +900,7 @@ try {
   d.close();
   const plain = fs.readFileSync(workerData.tmp); fs.unlinkSync(workerData.tmp);
   const hash = crypto.createHash('sha256').update(plain).digest('hex');
-  const gz = zlib.gzipSync(plain, { level: 6 });
+  const gz = zlib.gzipSync(plain, { level: 1 });
   parentPort.postMessage({ ok: true, gz, hash, size: plain.length });
 } catch (e) { parentPort.postMessage({ ok: false, error: e.message }); }
 `;
@@ -961,7 +961,7 @@ async function pushNow() {
   if (!configured()) return { skipped: true };
   if (Date.now() < frozenUntil) return { skipped: 'frozen' };
   if (running) { pending = true; return { queued: true }; }
-  running = true;
+  running = true; lastStart = Date.now();
   try {
     const s = await snapshot();
     if (s.hash === lastHash) return { unchanged: true };
@@ -982,16 +982,22 @@ async function pushNow() {
     return { error: e.message };
   } finally {
     running = false;
-    if (pending) { pending = false; setTimeout(() => pushNow(), 2000); }
+    if (pending) { pending = false; schedule(2000); }
   }
 }
 
 let timer = null;
 // Respaldo como máximo "ms" después del primer cambio (antes se reiniciaba el reloj con cada cambio y con
 // mucha actividad el respaldo podía atrasarse varios minutos)
+// Cada respaldo copia y comprime TODA la base de datos: con la base grande y media CPU en Render, respaldar después
+// de cada cambio dejaba la app sin CPU y Render la reiniciaba ("health check failed"). Ahora: como mucho 1 cada 10 minutos
+// (y siempre al apagarse, así que un reinicio normal no pierde nada).
+const MIN_GAP = 10 * 60e3;
+let lastStart = 0;
 function schedule(ms = 10000) {
   if (!configured() || timer) return;
-  timer = setTimeout(() => { timer = null; pushNow(); }, ms);
+  const wait = Math.max(ms, lastStart + MIN_GAP - Date.now());
+  timer = setTimeout(() => { timer = null; pushNow(); }, wait);
 }
 
 function status() { return { configured: configured(), repo: repo(), lastOkAt, lastError }; }
