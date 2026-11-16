@@ -1796,7 +1796,11 @@ async function itemIds(conn, ids) {
       const r = await api(conn, `/items?ids=${chunk.join(',')}&attributes=id,family_id,user_product_id`);
       for (const x of Array.isArray(r) ? r : []) put(x.body);
     } catch (e) {
-      if (/403/.test(e.message)) { itemsForbiddenAt = Date.now(); console.warn('[ML] sin permiso para leer publicaciones (/items): no se puede leer el ID de familia'); return {}; }
+      // Mercado Libre a veces rechaza la consulta de varias publicaciones juntas (403 "ResourceDeprecated"):
+      // se piden de a una, que sí responde. Solo si también falla de a una se deja de insistir por 20 minutos.
+      let okOne = 0;
+      for (const id of chunk) { try { put(await api(conn, `/items/${id}?attributes=id,family_id,user_product_id`)); okOne++; } catch { /* sigue */ } }
+      if (!okOne && /403/.test(e.message)) { itemsForbiddenAt = Date.now(); console.warn('[ML] sin permiso para leer publicaciones (/items): no se puede leer el ID de familia'); break; }
     }
   }
   const out = {}; for (const id of ids) if (idCache.has(id)) out[id] = idCache.get(id);
@@ -3488,6 +3492,7 @@ function connObj(row) {
   return o;
 }
 
+let famStmt = null;
 function blockedBy(order) {
   // espacio sin fulfillment: no hay bloqueo de etiquetas por producto
   if (!require('./spaces').ffOnForSeller(order.seller_id)) return [];
@@ -3496,8 +3501,11 @@ function blockedBy(order) {
   const hits = [];
   // Normaliza: mayúsculas, sin espacios/guiones, y el ID de Mercado Libre con o sin "MLC" (MLC123 = 123)
   const norm = v => { const x = String(v).trim().toUpperCase().replace(/[\s#-]+/g, ''); return [x, x.replace(/^MLC/, '')]; };
+  // ID de familia / producto guardado (por si Mercado Libre no lo entregó en esta sincronización)
+  let famQ = null; try { famQ = famStmt || (famStmt = db.prepare('SELECT family_id, up_id FROM item_family WHERE marketplace=? AND pub_id=?')); } catch { /* tabla aún no creada */ }
   items.forEach((it, index) => {
-    const keys = new Set([it.sku, it.pub_id, it.fam_id, it.up_id].filter(Boolean).flatMap(norm)); // también el ID de familia / producto de Mercado Libre
+    const saved = famQ && it.pub_id ? famQ.get(order.marketplace, String(it.pub_id)) : null;
+    const keys = new Set([it.sku, it.pub_id, it.fam_id, it.up_id, saved?.family_id, saved?.up_id].filter(Boolean).flatMap(norm)); // también el ID de familia / producto de Mercado Libre
     const r = rules.find(r => (r.marketplace === 'any' || r.marketplace === order.marketplace) && norm(r.value).some(k => k && keys.has(k)));
     if (r) hits.push({ index, sku: it.sku, pub_id: it.pub_id, name: it.name, rule: r.value });
   });
@@ -3630,6 +3638,12 @@ async function upsert(conn, s) {
     db.prepare(`UPDATE orders SET printed_at=datetime('now'), printed_by=? WHERE id=?`).run(`Impresa en ${MKNAME[mk] || 'el marketplace'}`, existing.id);
     logEvent(existing.seller_id, 'print', `Pedido ${existing.order_number}: impreso directamente en ${MKNAME[mk] || 'el marketplace'}`);
   }
+  // si esta vez el marketplace no entregó el ID de familia / producto, se mantiene el que ya estaba (sin él, un producto
+  // bloqueado por familia —p. ej. los lentes— se "desbloquearía" solo)
+  try {
+    const prev = new Map(JSON.parse(existing.items || '[]').map(it => [String(it.pub_id || ''), it]));
+    for (const it of s.items || []) { const p = prev.get(String(it.pub_id || '')); if (p) { if (!it.fam_id && p.fam_id) it.fam_id = p.fam_id; if (!it.up_id && p.up_id) it.up_id = p.up_id; } }
+  } catch { /* sin datos previos */ }
   // si cambiaron los productos (p. ej. llegó el color o el resto del carrito) y aún no se imprime, la etiqueta se rehace
   if (existing.items !== JSON.stringify(s.items) && existing.label_file && ['ready', 'waiting', 'error'].includes(state)) {
     db.prepare('UPDATE orders SET label_file=NULL WHERE id=?').run(existing.id);
