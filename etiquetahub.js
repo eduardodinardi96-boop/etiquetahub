@@ -990,9 +990,9 @@ let timer = null;
 // Respaldo como máximo "ms" después del primer cambio (antes se reiniciaba el reloj con cada cambio y con
 // mucha actividad el respaldo podía atrasarse varios minutos)
 // Cada respaldo copia y comprime TODA la base de datos: con la base grande y media CPU en Render, respaldar después
-// de cada cambio dejaba la app sin CPU y Render la reiniciaba ("health check failed"). Ahora: como mucho 1 cada 10 minutos
+// de cada cambio dejaba la app sin CPU y Render la reiniciaba ("health check failed"). Ahora: como mucho 1 por minuto
 // (y siempre al apagarse, así que un reinicio normal no pierde nada).
-const MIN_GAP = 10 * 60e3;
+const MIN_GAP = 60e3; // 1 minuto (pedido por Javi)
 let lastStart = 0;
 function schedule(ms = 10000) {
   if (!configured() || timer) return;
