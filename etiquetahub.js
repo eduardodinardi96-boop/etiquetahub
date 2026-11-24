@@ -3499,24 +3499,46 @@ function connObj(row) {
 }
 
 let famStmt = null;
+// Normaliza: mayúsculas, sin espacios/guiones, y el ID de Mercado Libre con o sin "MLC" (MLC123 = 123)
+const normKey = v => { const x = String(v).trim().toUpperCase().replace(/[\s#-]+/g, ''); return [x, x.replace(/^MLC/, '')]; };
+// Reglas de bloqueo por vendedor ya normalizadas (se rearman cada 3 s o al cambiar la lista): antes se leían y
+// normalizaban en cada pedido, y con 1.000+ pedidos la Bandeja tardaba varios segundos
+const ruleCache = new Map();
+function rulesOf(sellerId) {
+  const c = ruleCache.get(sellerId);
+  if (c && Date.now() - c.at < 3000) return c;
+  const rows = db.prepare('SELECT marketplace, value FROM blocklist WHERE seller_id = ? ORDER BY id').all(sellerId);
+  const any = new Map(), byMk = new Map();
+  for (const r of rows) {
+    const target = r.marketplace === 'any' ? any : (byMk.get(r.marketplace) || byMk.set(r.marketplace, new Map()).get(r.marketplace));
+    for (const k of normKey(r.value)) if (k && !target.has(k)) target.set(k, r);
+  }
+  const out = { at: Date.now(), any, byMk };
+  ruleCache.set(sellerId, out);
+  return out;
+}
 function blockedBy(order) {
   // espacio sin fulfillment: no hay bloqueo de etiquetas por producto
   if (!require('./spaces').ffOnForSeller(order.seller_id)) return [];
   const items = typeof order.items === 'string' ? JSON.parse(order.items) : order.items;
-  const rules = db.prepare('SELECT marketplace, value FROM blocklist WHERE seller_id = ?').all(order.seller_id);
+  const R = rulesOf(order.seller_id);
+  if (!R.any.size && !R.byMk.size) return [];
+  const mkRules = R.byMk.get(order.marketplace);
   const hits = [];
-  // Normaliza: mayúsculas, sin espacios/guiones, y el ID de Mercado Libre con o sin "MLC" (MLC123 = 123)
-  const norm = v => { const x = String(v).trim().toUpperCase().replace(/[\s#-]+/g, ''); return [x, x.replace(/^MLC/, '')]; };
   // ID de familia / producto guardado (por si Mercado Libre no lo entregó en esta sincronización)
   let famQ = null; try { famQ = famStmt || (famStmt = db.prepare('SELECT family_id, up_id FROM item_family WHERE marketplace=? AND pub_id=?')); } catch { /* tabla aún no creada */ }
   items.forEach((it, index) => {
+    if (!it) return;
     const saved = famQ && it.pub_id ? famQ.get(order.marketplace, String(it.pub_id)) : null;
-    const keys = new Set([it.sku, it.pub_id, it.fam_id, it.up_id, saved?.family_id, saved?.up_id].filter(Boolean).flatMap(norm)); // también el ID de familia / producto de Mercado Libre
-    const r = rules.find(r => (r.marketplace === 'any' || r.marketplace === order.marketplace) && norm(r.value).some(k => k && keys.has(k)));
+    const keys = [it.sku, it.pub_id, it.fam_id, it.up_id, saved?.family_id, saved?.up_id].filter(Boolean).flatMap(normKey); // también el ID de familia / producto de Mercado Libre
+    let r = null;
+    for (const k of keys) { if (!k) continue; r = (mkRules && mkRules.get(k)) || R.any.get(k); if (r) break; }
     if (r) hits.push({ index, sku: it.sku, pub_id: it.pub_id, name: it.name, rule: r.value });
   });
   return hits;
 }
+const clearRuleCache = sellerId => (sellerId ? ruleCache.delete(sellerId) : ruleCache.clear());
+bus.on('change', ev => { if (ev && ev.type === 'blocklist') clearRuleCache(ev.sellerId); });
 
 // Bloqueada = tiene un producto bloqueado y nadie la desbloqueó a mano
 const isBlocked = o => !o.unblocked_at && blockedBy(o).length > 0;
@@ -3773,7 +3795,7 @@ function start() {
   console.log(`Sincronización automática cada ${every / 1000} s`);
 }
 
-module.exports = { isBlocked, assignBlockNumbers, bus, start, tryLabel, fetchLabelFile, syncConnection, syncAll, blockedBy, labelPath, connObj, connectors, retryUnblocked, logEvent };
+module.exports = { clearRuleCache, isBlocked, assignBlockNumbers, bus, start, tryLabel, fetchLabelFile, syncConnection, syncAll, blockedBy, labelPath, connObj, connectors, retryUnblocked, logEvent };
 
 };
 
@@ -6202,11 +6224,13 @@ function orderView(o, user) {
 function chileAt(day, hhmmss) {
   const [y, m, d] = day.split('-').map(Number), [h, mi, se] = hhmmss.split(':').map(Number);
   const guess = Date.UTC(y, m - 1, d, h, mi, se || 0);
-  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }).formatToParts(new Date(guess)).map(x => [x.type, x.value]));
+  const p = Object.fromEntries((chileAt._f || (chileAt._f = new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' }))).formatToParts(new Date(guess)).map(x => [x.type, x.value]));
   const asLocal = Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second);
   return new Date(guess - (asLocal - guess));
 }
-const chileDay = d => new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(d);
+// el formateador se crea una sola vez (crearlo en cada llamada hacía lenta la Bandeja con muchos pedidos)
+const CHILE_DAY_FMT = new Intl.DateTimeFormat('en-CA', { timeZone: cfg.timezone, year: 'numeric', month: '2-digit', day: '2-digit' });
+const chileDay = d => CHILE_DAY_FMT.format(d);
 const parseD = v => { if (!v) return null; const d = new Date(String(v).includes('T') ? v : String(v).replace(' ', 'T')); return isNaN(d) ? null : d; };
 // Día de despacho de Paris: el día (hora de Chile) del plazo que informa Paris; se puede entregar hasta las 23:59
 function parisDay(v) {
