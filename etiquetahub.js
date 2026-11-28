@@ -2105,6 +2105,20 @@ function flatten(list) {
 // Paris no manda el color en la orden: se lee de la variante del producto (/v2/products/{id}) y se guarda
 const db = require('../db');
 db.exec('CREATE TABLE IF NOT EXISTS pa_variant (sku TEXT PRIMARY KEY, text TEXT, at INTEGER)');
+// Foto del producto: Paris la manda en cada ítem del pedido (imagePath); se guarda en versión chica
+const paImg = u => String(u || '').replace(/\/adaptive-fit-in\/\d+x\d+\//, '/adaptive-fit-in/240x320/');
+function saveThumb(it) {
+  if (!it || !it.sku || !it.imagePath) return;
+  try { db.prepare("INSERT OR REPLACE INTO item_thumb (marketplace, key, url, fetched_at) VALUES ('pa',?,?,datetime('now'))").run(String(it.sku), paImg(it.imagePath)); } catch { /* tabla aún no creada */ }
+}
+// Foto desde la ficha del producto (para pedidos antiguos que no la guardaron)
+async function productImage(conn, sku) {
+  const p = await api(conn, `/v2/products/${encodeURIComponent(String(sku).replace(/-\d+$/, ''))}`);
+  const prod = p?.results?.[0] || p?.data || p;
+  const v = (prod?.variants || []).find(x => String(x.sku) === String(sku));
+  const find = o => { const m = JSON.stringify(o || {}).match(/https?:\/\/[^"\s]+?\.(?:jpe?g|png|webp)/i); return m ? m[0] : ''; };
+  return paImg(find(v) || find(prod));
+}
 const VAR_ATTR = /^(color|colour|talla|tama[nñ]o|medida|dise[nñ]o|modelo|sabor|aroma|capacidad)/i;
 async function variantText(conn, sku) {
   if (!sku) return '';
@@ -2130,6 +2144,7 @@ async function withVariants(conn, items) {
 function itemsOf(list) {
   const g = new Map();
   for (const it of list || []) {
+    saveThumb(it);
     const k = it.sku || it.sellerSku || it.name;
     if (!g.has(k)) g.set(k, { name: it.name, variant: it.size ? `Talla/Tamaño: ${it.size}` : '', sku: it.sellerSku || '', pub_id: it.sku || '', qty: 0 });
     g.get(k).qty += Number(it.quantity || 1);
@@ -2196,6 +2211,7 @@ async function sales(conn, fromISO, toISO) {
       if (/cancel|anulad|rechaz/.test(status)) continue;
       const g = new Map();
       for (const it of sub.items || []) {
+        saveThumb(it);
         const k = it.sellerSku || it.sku || it.name;
         const qty = Number(it.quantity || 1);
         const line = Number(it.priceAfterDiscounts ?? it.grossPrice ?? 0) || Number(it.price ?? it.basePrice ?? 0) * qty;
@@ -2249,7 +2265,7 @@ async function setStock(conn, ref, qty) {
   await api(conn, '/v2/stock', { method: 'POST', body: JSON.stringify({ skus: [{ sku: String(ref), quantity: Math.max(0, qty) }] }) });
 }
 
-module.exports = { stockListings, setStock, raw: api, flatten, refresh, debugOrder, sales, test, listShipments, fetchLabel };
+module.exports = { stockListings, setStock, raw: api, flatten, refresh, debugOrder, sales, test, listShipments, fetchLabel, productImage };
 
 };
 
@@ -4189,6 +4205,10 @@ async function fillThumbs(wanted) {
             for (const pr of r?.products || []) { got.add(String(pr.id)); put.run('sh', String(pr.id), String(pr.image?.src || '')); }
             for (const id of chunk) if (!got.has(id)) put.run('sh', id, '');
           }
+        } else if (mk === 'pa') {
+          // Paris: foto de la ficha del producto
+          const pac = require('./connectors/paris');
+          for (const id of uniq.slice(0, 60)) { const u = await pac.productImage(conn, id).catch(() => ''); put.run('pa', id, u || ''); }
         } else for (const id of uniq) put.run(mk, id, '');
       } catch (e) { console.warn('[thumbs]', mk, e.message); }
     }
@@ -4289,11 +4309,13 @@ function start() {
 const thumbWant = new Map(); let thumbTimer = null;
 // Antes Shopify no se consultaba y quedó guardado "sin foto": se borra para pedirla de nuevo
 try { db.prepare("DELETE FROM item_thumb WHERE marketplace='sh' AND (url IS NULL OR url='')").run(); } catch {}
+// Paris antes quedaba siempre "sin foto": se borra para pedirla de nuevo
+try { db.prepare("DELETE FROM item_thumb WHERE marketplace='pa' AND (url IS NULL OR url='')").run(); } catch {}
 function itemThumbs(o, items) {
   // las que quedaron "sin foto" se vuelven a intentar una vez al día
   const q = db.prepare("SELECT url FROM item_thumb WHERE marketplace=? AND key=? AND NOT (url='' AND fetched_at < datetime('now','-1 day'))");
   return items.map(it => {
-    const key = o.marketplace === 'fa' ? it.sku : it.pub_id; if (!key || !['ml', 'fa', 'sh'].includes(o.marketplace)) return '';
+    const key = o.marketplace === 'fa' ? it.sku : it.pub_id; if (!key || !['ml', 'fa', 'sh', 'pa'].includes(o.marketplace)) return '';
     const t = q.get(o.marketplace, String(key));
     if (!t) {
       thumbWant.set(o.marketplace + '|' + key, { marketplace: o.marketplace, seller_id: o.seller_id, key: String(key) });
